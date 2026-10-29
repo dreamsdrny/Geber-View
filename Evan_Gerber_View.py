@@ -48,63 +48,87 @@ from win_dpi import (apply_tk_scaling, enable_dpi_awareness,
 def apply_icon(root) -> None:
     """任务栏 / 标题栏图标: 多尺寸 ico + png"""
     try:
-        ico = icon_ico()
-        if os.path.exists(ico):
+        # ---- 第一步：优先用 .ico（Windows 原生支持多尺寸，任务栏/标题栏自适应）----
+        ico = icon_ico()                      # 外部函数：返回 ico 文件的绝对路径
+        if os.path.exists(ico):               # 文件不存在就跳过，不报错
+            # iconbitmap 是 Tk 的窗口图标接口；不同 Tk 版本方法名略有差异，
+            # 所以 iconbitmap / wm_iconbitmap 两个名字都试一遍，失败就忽略
             for fn in ("iconbitmap", "wm_iconbitmap"):
                 try:
-                    getattr(root, fn)(ico)
+                    getattr(root, fn)(ico)    # 给当前 root 窗口设置标题栏/任务栏图标
                 except Exception:  # noqa: BLE001
-                    pass
+                    pass                      # 某个名字不支持就算了，继续试下一个
+            # default=ico 表示把该 ico 设为 Tk 的“默认图标”，
+            # 之后新建的 Toplevel 窗口不单独设置也会自动继承
             try:
                 root.iconbitmap(default=ico)
             except Exception:  # noqa: BLE001
                 pass
-        png = icon_png()
+
+        # ---- 第二步：再用 .png 兜底（跨平台更可靠，Linux 下尤其有用）----
+        png = icon_png()                      # 外部函数：返回 png 文件路径
         if os.path.exists(png):
-            from tkinter import PhotoImage
+            from tkinter import PhotoImage     # 延迟导入，避免顶层依赖 tkinter
             try:
-                img = PhotoImage(file=png)
-                root.iconphoto(True, img)
-                root._ebv_icon = img      # 保留引用防 GC
+                img = PhotoImage(file=png)     # 读成 Tk 图像对象
+                root.iconphoto(True, img)      # True=同时作用于后续所有窗口
+                root._ebv_icon = img           # 关键：把引用挂到 root 上，
+                                               # 否则 img 被 GC 回收后图标会变空白
             except Exception:  # noqa: BLE001
                 pass
     except Exception:  # noqa: BLE001
-        pass
+        pass                                   # 整个函数静默失败：图标只是锦上添花，
+                                               # 绝不能因为它导致程序启动崩溃
 
 
 def main():
+    # ---- 启动前的“平台初始化”：必须在创建 Tk() 之前完成 ----
     try:
+        # Windows 下声明 DPI 感知，否则高分屏上窗口/字体被系统拉伸、发虚
         enable_dpi_awareness()
+        # 设置 AppUserModelID：让 Windows 任务栏把进程归到“自己的应用”下，
+        # 这样自定义图标、任务栏分组、跳转列表才按预期生效（不设容易被归到 python.exe）
         set_app_user_model_id(APP_USER_MODEL_ID)
     except Exception:  # noqa: BLE001
-        pass
+        pass          # 非 Windows / 老系统 / 调用失败都无所谓，静默降级
 
+    # 延迟导入：放在初始化之后、创建窗口之前。
+    # 好处是 --help、导入期报错、甚至上面的初始化失败时都不会牵连 tkinter 的加载；
+    # 也避免了 gerber_viewer 在模块顶层就 import tkinter 造成的循环/重量级依赖
     from gerber_viewer import GerberViewer
 
-    root = tk.Tk()
-    root.withdraw()                       # 主窗口隐藏, 只显示查看器 Toplevel
-    root.title(win_title())
+    root = tk.Tk()                 # 创建 Tk 根窗口（所有 Toplevel 的父级）
+    root.withdraw()                # 立刻隐藏根窗口：本程序不显示主窗体，
+                                   # 只把 GerberViewer 自己的 Toplevel 作为可见界面
+    root.title(win_title())        # 给 root 设标题：部分平台上 Toplevel 未设标题时
+                                   # 会回退到父窗口标题，也算一层兜底
     try:
-        apply_tk_scaling(root)
+        apply_tk_scaling(root)     # 按系统 DPI 调整 Tk 的 scaling（字体/控件尺寸），
+                                   # 让界面在高分屏上比例正常
     except Exception:  # noqa: BLE001
-        pass
-    apply_icon(root)
+        pass                       # 缩放失败不影响功能，只是观感差一点
+    apply_icon(root)               # 设置标题栏/任务栏图标（内部已静默容错）
 
-    viewer = GerberViewer(root)
+    viewer = GerberViewer(root)    # 构建查看器：内部会基于 root 创建自己的 Toplevel（win）
 
     def _close():
         """关闭查看器窗口时同时退出程序"""
         try:
-            viewer._on_close()
+            viewer._on_close()     # 先走查看器自己的清理（保存状态、停定时器、释放资源等）
         finally:
             try:
-                root.destroy()
+                root.destroy()     # 无论 _on_close 是否抛异常，都销毁根窗口 → 结束 mainloop
             except Exception:  # noqa: BLE001
                 pass
 
+    # 关键：用户点查看器窗口右上角 × 时，走 _close 而不是只关掉那个 Toplevel。
+    # 因为 root 是隐藏的、mainloop 还挂在 root 上，只关 Toplevel 程序不会退出
     viewer.win.protocol("WM_DELETE_WINDOW", _close)
-    root.mainloop()
+
+    root.mainloop()                # 进入事件循环，直到 root.destroy() 才返回
 
 
 if __name__ == "__main__":
+    # 仅当作为脚本直接运行时执行 main()；
+    # 被 import（如测试、打包入口调用）时不自动启动 GUI
     main()

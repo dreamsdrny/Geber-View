@@ -19,9 +19,18 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # 这些都没被程序用到, 但会被自动收集进 _internal (尤其 numpy),
+        # 白白拖慢启动 (杀软扫描 + 模块索引) 并让体积膨胀几十 MB
+        'numpy', 'scipy', 'pandas', 'matplotlib', 'IPython', 'pytest',
+        'unittest', 'pydoc', 'doctest', 'asyncio', 'ssl', 'decimal', '_decimal',
+        'bz2', '_bz2', 'lzma', '_lzma', 'multiprocessing', 'concurrent',
+        'xml', 'email', 'http', 'html', 'wmi', 'win32com', 'pythoncom',
+        'pywintypes', 'setuptools', 'pkg_resources',
+        'PIL.ImageQt', 'PIL.ImageShow', 'PIL.ImageGrab', 'PIL.ImageCms',
+    ],
     noarchive=False,
-    optimize=0,
+    optimize=2,
 )
 pyz = PYZ(a.pure)
 
@@ -34,7 +43,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -48,7 +57,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='Evan_Gerber_View',
 )

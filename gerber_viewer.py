@@ -53,13 +53,17 @@ _WARM = ["#ff4d4f", "#ff9f43", "#ffd166", "#ef476f", "#f78c6b", "#e63946", "#ff8
 _COOL = ["#3fa9ff", "#06d6a0", "#4cc9f0", "#5b8def", "#00b4d8", "#48cae4", "#2ec4b6", "#4361ee"]
 
 BG_RGB = (15, 17, 21)
-MAX_BASE = 2600          # 单层缓存位图最长边上限 (px), 防内存暴涨
-QUALITY = 1.0            # 缓存位图按显示比例渲染 → 静止时合成可 1:1 免重采样 (平移更流畅)
+# 每层缓存改为 [L 灰度掩膜 + 固定颜色] 而不是 RGBA:
+#   - 合成时只重采样覆盖率, 不会把透明区的黑色混进边缘 (RGBA 未预乘会产生黑边/发灰)
+#   - 1 字节/像素, 同样内存预算下分辨率可以更高 -> 放大时更清晰
+MAX_BASE = 3200          # 单层缓存位图最长边上限 (px)
+QUALITY = 1.0            # 缓存位图按显示比例渲染 -> 静止时合成可 1:1 免重采样 (平移更流畅)
+SS_MAX_PIXELS = 8_000_000  # 最终位图不超过该像素数时按 2x 超采样绘制 (抗锯齿)
 DIFF_PX = 1500           # 差异栅格化最长边 (px)
 DIFF_GRID = 200          # 差异定位网格 (每边单元数)
-DIFF_THRESH = 0.28       # 单元覆盖率差阈值 → 判为差异
-MAX_MARKERS = 1500       # 图上最多绘制的差异标记数
-BUDGET_BYTES = 520_000_000  # 全部图层位图缓存内存上限 (~520MB RGBA), 超出则按 LRU 释放隐藏层
+DIFF_THRESH = 0.28       # 单元覆盖率差阈值 -> 判为差异
+MAX_MARKERS = 600        # 图上最多绘制的差异标记数 (太多会拖慢每帧合成)
+BUDGET_BYTES = 320_000_000  # 全部图层掩膜缓存上限 (1 字节/像素), 超出则按 LRU 释放隐藏层
 
 # 常见「单位/坐标格式」错误倍数: 不同 CAM 导出时英寸↔毫米、小数位差一位等
 _KNOWN_FACTORS = (1000.0, 254.0, 100.0, 25.4, 10.0, 2.54, 1.0 / 2.54,
@@ -107,6 +111,7 @@ class GerberLayer:
         self.token = 0                     # 渲染令牌 (丢弃过期结果)
         self.pending = False               # 是否有在途渲染任务
         self.lru = 0.0
+        self.solid = None                  # 与 base_img 同尺寸的纯色图 (合成时按掩膜贴上去)
 
     # ---------------- 比例校正 ----------------
     def apply_scale(self, factor, auto=False):
@@ -122,6 +127,7 @@ class GerberLayer:
         self.auto_scaled = self.auto_scaled or auto
         self.base_img = None
         self.base_bbox = None
+        self.solid = None
         self.token += 1
         self.pending = False
 
@@ -135,6 +141,7 @@ class GerberLayer:
         self.data["_role"] = role
         self.base_img = None
         self.base_bbox = None
+        self.solid = None
         self.token += 1
         self.pending = False
 
@@ -237,6 +244,9 @@ class GerberViewer:
         self._lru_clock = 0.0
         self._frame_scale = None
         self._interactive = False           # 交互中(拖动/平移/缩放) → 用更快但略粗的重采样
+        self._hover_job = None              # 坐标读数节流定时器
+        self._hover_xy = None
+        self._cfg_job = None                # 窗口尺寸变化防抖定时器
 
         self._stop = threading.Event()
         self._parse_q = queue.Queue()
@@ -253,6 +263,14 @@ class GerberViewer:
             from PIL import Image, ImageDraw, ImageTk
             self._pil = (Image, ImageDraw, ImageTk)
         return self._pil
+
+    def _ui_scale(self):
+        """当前窗口的 DPI 缩放 (1.0 = 96 DPI), 用来把写死的像素尺寸换算成视觉尺寸"""
+        try:
+            from win_dpi import get_dpi
+            return max(1.0, float(get_dpi(self.win)) / 96.0)
+        except Exception:  # noqa: BLE001
+            return 1.0
 
     # ---------------- UI ----------------
     def _build(self):
@@ -323,24 +341,27 @@ class GerberViewer:
         ttk.Button(btnbar, text="关选中", width=6, command=lambda: self._set_sel(False)).pack(side=tk.LEFT, padx=2)
         ttk.Button(btnbar, text="反选", width=5, command=self._invert).pack(side=tk.LEFT)
 
+        ui = self._ui_scale()
         style = ttk.Style(self.win)
         try:
-            style.configure("GerberLayers.Treeview", font=("Microsoft YaHei UI", 11), rowheight=28)
+            style.configure("GerberLayers.Treeview",
+                            font=("Microsoft YaHei UI", 11), rowheight=int(28 * ui))
             style.configure("GerberLayers.Treeview.Heading",
                             font=("Microsoft YaHei UI", 10, "bold"))
         except Exception:
             pass
+        # 行高随 DPI 放大, 可见行数相应减少 -> 总高度不变, 文字不会被裁掉
         self.tree = ttk.Treeview(left, columns=("st", "name", "type", "unit"), show="headings",
-                                 height=26, selectmode="extended",
+                                 height=max(8, int(26 / ui)), selectmode="extended",
                                  style="GerberLayers.Treeview")
         self.tree.heading("st", text="开/关")
         self.tree.heading("name", text="图层")
         self.tree.heading("type", text="类型")
         self.tree.heading("unit", text="单位/格式")
-        self.tree.column("st", width=54, anchor=tk.CENTER, stretch=False)
-        self.tree.column("name", width=196, anchor=tk.W)
-        self.tree.column("type", width=72, anchor=tk.CENTER, stretch=False)
-        self.tree.column("unit", width=86, anchor=tk.CENTER, stretch=False)
+        self.tree.column("st", width=int(54 * ui), anchor=tk.CENTER, stretch=False)
+        self.tree.column("name", width=int(196 * ui), anchor=tk.W)
+        self.tree.column("type", width=int(72 * ui), anchor=tk.CENTER, stretch=False)
+        self.tree.column("unit", width=int(86 * ui), anchor=tk.CENTER, stretch=False)
         self.tree.pack(side=tk.LEFT, fill=tk.Y)
         tsb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=tsb.set)
@@ -353,7 +374,7 @@ class GerberViewer:
 
         self.canvas = tk.Canvas(body, bg="#0f1115", highlightthickness=0)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.canvas.bind("<MouseWheel>", lambda e: self._zoom(1.2 if e.delta > 0 else 0.8))
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
@@ -361,7 +382,7 @@ class GerberViewer:
         self.canvas.bind("<B3-Motion>", self._pan_move)
         self.canvas.bind("<ButtonRelease-3>", self._on_release)
         self.canvas.bind("<Motion>", self._on_hover)
-        self.canvas.bind("<Configure>", lambda e: self._schedule_render())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
 
         self.status = tk.StringVar(value="Ready")
         ttk.Label(self.win, textvariable=self.status, relief=tk.SUNKEN,
@@ -448,13 +469,15 @@ class GerberViewer:
             self.status.set(msg[1])
         elif t == "layer":
             _, data, path, group = msg
-            self._add_layer_data(data, path, group)
+            # 批量导入时先不进 Treeview, 等 parse_done 一次性重建 (原来每层都重建整表)
+            self._add_layer_data(data, path, group, refresh=False)
         elif t == "parse_err":
             self.status.set(f"解析失败: {msg[1]} — {msg[2]}")
         elif t == "parse_done":
             _, _n, group = msg
             self._batch = max(0, self._batch - _n)
             if self._batch == 0:
+                self._refresh_list()                            # 全部解析完成后只重建一次
                 notes = self._auto_check_scales(True, True)      # 单位/格式差异自动校正
                 if group in ("A", "B") and any(l.group == "A" for l in self.layers) \
                         and any(l.group == "B" for l in self.layers):
@@ -511,7 +534,7 @@ class GerberViewer:
             return _TYPE_COLOR.get(("drill", key), "#ffffff")
         return _TYPE_COLOR.get((k, side), _PALETTE[len(self.layers) % len(_PALETTE)])
 
-    def _add_layer_data(self, data, path, group):
+    def _add_layer_data(self, data, path, group, refresh=True):
         name = os.path.basename(path)
         if group:
             name = f"[{group}] {name}"
@@ -524,11 +547,12 @@ class GerberViewer:
         ly.visible = True
         self.layers.append(ly)
         self._recompute_view_bbox()
-        self._refresh_list()
         self.selected = len(self.layers) - 1
-        self._sync_selection()
+        if refresh:
+            self._refresh_list()
+            self._sync_selection()
+            self._schedule_render()
         self._request_base(ly)
-        self._schedule_render()
 
     def add_layer(self, path, color=None, name=None, fit_now=True):
         data = parse_gerber(path, layer_name=name or os.path.basename(path))
@@ -683,6 +707,7 @@ class GerberViewer:
         if not hexc:
             return
         ly.color = hexc
+        ly.solid = None
         self._invalidate(ly)          # 颜色已烘焙进位图 → 需重渲
         self._refresh_list()
         self.info.set(f"{ly.name}: 颜色已改为 {hexc}")
@@ -758,7 +783,7 @@ class GerberViewer:
     def _img_bytes(self, ly):
         try:
             w, h = ly.base_img.size
-            return w * h * 4
+            return w * h          # L 掩膜: 1 字节/像素
         except Exception:  # noqa: BLE001
             return 0
 
@@ -776,6 +801,7 @@ class GerberViewer:
                 break
             total -= self._img_bytes(l)
             l.base_img = None
+            l.solid = None
             l.pending = False
 
     def _move_layer(self, direction):
@@ -829,6 +855,7 @@ class GerberViewer:
 
     def _invalidate(self, ly):
         ly.base_img = None
+        ly.solid = None
         ly.token += 1
         ly.pending = False
         if ly.visible:
@@ -1065,12 +1092,25 @@ class GerberViewer:
                 self._request_base(ly)
         self._schedule_render()
 
-    def _zoom(self, factor):
-        z = self.zoom * factor
-        self.zoom = max(0.02, min(z, 400.0))
+    def _on_wheel(self, event):
+        """滚轮缩放: 以鼠标所在位置为锚点, 缩放后光标下的图形保持不动"""
+        self._zoom_at(1.2 if event.delta > 0 else 1.0 / 1.2, event.x, event.y)
+
+    def _zoom_at(self, factor, px=None, py=None):
+        wx = wy = None
+        if px is not None and py is not None:
+            wx, wy = self._canvas_to_mm(px, py)      # 缩放前光标下的世界坐标
+        self.zoom = max(0.02, min(self.zoom * factor, 400.0))
+        if wx is not None:
+            s, minx, miny, maxx, maxy, W, H = self._scale()
+            self.pan[0] = px - W / 2 - (wx - (minx + maxx) / 2) * s
+            self.pan[1] = py - H / 2 + (wy - (miny + maxy) / 2) * s
         self._interactive = True
         self._schedule_render()
         self._schedule_settle()
+
+    def _zoom(self, factor):
+        self._zoom_at(factor)
 
     def _focus_mm(self, x, y, zoom=None):
         if zoom is not None:
@@ -1080,6 +1120,22 @@ class GerberViewer:
         for ly in self.layers:
             if ly.visible:
                 self._request_base(ly)
+        self._schedule_render()
+
+    def _on_canvas_configure(self, _event):
+        """窗口尺寸变化: 防抖, 避免拖动窗口边缘时每帧全量重合成"""
+        if self._cfg_job is not None:
+            try:
+                self.win.after_cancel(self._cfg_job)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._cfg_job = self.win.after(120, self._do_resize_render)
+        except Exception:  # noqa: BLE001
+            self._cfg_job = None
+
+    def _do_resize_render(self):
+        self._cfg_job = None
         self._schedule_render()
 
     def _schedule_render(self):
@@ -1099,6 +1155,8 @@ class GerberViewer:
                 self.status.set(f"渲染出错: {exc}")
             except Exception:
                 pass
+        finally:
+            self._frame_scale = None          # 中途抛错也不会把比例尺冻住
 
     def _schedule_settle(self):
         """交互停止后, 按当前比例请求更清晰的缓存位图"""
@@ -1161,7 +1219,19 @@ class GerberViewer:
             self._schedule_render()
 
     def _on_hover(self, event):
-        x, y = self._canvas_to_mm(event.x, event.y)
+        # 鼠标每移动 1px 就刷 Label 会让 Tk 反复重排 -> 60ms 节流
+        self._hover_xy = (event.x, event.y)
+        if self._hover_job is None:
+            try:
+                self._hover_job = self.win.after(60, self._flush_hover)
+            except Exception:  # noqa: BLE001
+                self._hover_job = None
+
+    def _flush_hover(self):
+        self._hover_job = None
+        if not self._hover_xy:
+            return
+        x, y = self._canvas_to_mm(*self._hover_xy)
         self.status.set(f"X={x:.3f}mm  Y={y:.3f}mm   (mil: {x*39.3701:.1f} x {y*39.3701:.1f})")
 
     # ---------------- 位图缓存请求 ----------------
@@ -1173,8 +1243,9 @@ class GerberViewer:
         s = self._scale()[0] or 1.0
         # 自适应分辨率上限: 可见/已缓存层越多, 单层缓存越小, 总内存有界
         vis = max(1, sum(1 for l in self.layers if l.visible or l.base_img is not None))
-        cap = int(math.sqrt(max(1.0, (400_000_000 // 4) / vis)))
-        cap = max(900, min(MAX_BASE, cap))
+        # L 掩膜 1 字节/像素, 每层可用像素数 = 预算/层数 -> 层多时分辨率也不至于塌掉
+        cap = int(math.sqrt(max(1.0, BUDGET_BYTES / vis)))
+        cap = max(1200, min(MAX_BASE, cap))
         target = min(s * QUALITY, cap / max(w, h))
         if ly.pending:
             return
@@ -1307,6 +1378,11 @@ class GerberViewer:
         return T
 
     def _render_layer_bitmap(self, data, kind, lb, mirror, color, target_scale):
+        """渲染单层掩膜 (L 灰度): 255 = 该处有图形, 0 = 空白。
+
+        抗锯齿: PIL 的 ImageDraw 是硬边, 位图不大时按 2x 超采样绘制再 LANCZOS 降采样,
+        边缘才有过渡像素; 位图很大时降回 1x, 避免内存/耗时失控。
+        """
         Image, ImageDraw, _ = self._PIL()
         minx, miny, maxx, maxy = lb
         w = max(maxx - minx, 1e-6); h = max(maxy - miny, 1e-6)
@@ -1314,11 +1390,14 @@ class GerberViewer:
         scale = max(scale, 1e-3)
         W = max(1, int(round(w * scale)) + 1)
         H = max(1, int(round(h * scale)) + 1)
-        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ss = 2 if W * H <= SS_MAX_PIXELS else 1
+        dw, dh = W * ss, H * ss
+        img = Image.new("L", (dw, dh), 0)
         draw = ImageDraw.Draw(img)
-        T = self._make_xform(lb, scale, H, mirror, (0.0, 0.0))
-        col = _hex_rgb(color) + (255,)
-        self._draw_prims(draw, data, kind, T, scale, col, (0, 0, 0, 0), ap_cache={})
+        T = self._make_xform(lb, scale * ss, dh, mirror, (0.0, 0.0))
+        self._draw_prims(draw, data, kind, T, scale * ss, 255, 0, ap_cache={})
+        if ss > 1:
+            img = img.resize((W, H), Image.LANCZOS)
         return img, scale
 
     def _render_mask(self, specs, bbox, scale):
@@ -1362,13 +1441,19 @@ class GerberViewer:
             self._draw_sel_rect(d, sel)
         if self.diff_points:
             self._draw_diff_markers(d)
-        photo = ImageTk.PhotoImage(canvas_img)
-        if self._img_item is None:
-            self._img_item = cv.create_image(0, 0, image=photo, anchor="nw")
+        if self._photo is None or self._photo.width() != W or self._photo.height() != H:
+            self._photo = ImageTk.PhotoImage(canvas_img)
+            if self._img_item is None:
+                self._img_item = cv.create_image(0, 0, image=self._photo, anchor="nw")
+            else:
+                cv.itemconfig(self._img_item, image=self._photo)
+                cv.coords(self._img_item, 0, 0)
         else:
-            cv.itemconfig(self._img_item, image=photo)
-            cv.coords(self._img_item, 0, 0)
-        self._photo = photo
+            try:
+                self._photo.paste(canvas_img)     # 复用同一 Tk 图像, 省掉每帧新建/整幅拷贝
+            except Exception:                     # noqa: BLE001
+                self._photo = ImageTk.PhotoImage(canvas_img)
+                cv.itemconfig(self._img_item, image=self._photo)
         self._frame_scale = None
         self._evict_cache()
         if any_pending:
@@ -1393,16 +1478,20 @@ class GerberViewer:
         fy0 = (cy0 - Y0) / (Y1 - Y0); fy1 = (cy1 - Y0) / (Y1 - Y0)
         bx0 = max(0, min(bw - 1, int(fx0 * bw))); bx1 = max(bx0 + 1, min(bw, int(fx1 * bw)))
         by0 = max(0, min(bh - 1, int(fy0 * bh))); by1 = max(by0 + 1, min(bh, int(fy1 * bh)))
-        crop = ly.base_img.crop((bx0, by0, bx1, by1))
+        mask = ly.base_img.crop((bx0, by0, bx1, by1))
         dw = cx1 - cx0; dh = cy1 - cy0
-        cw, chh = crop.size
+        cw, chh = mask.size
         if abs(cw - dw) > 1 or abs(chh - dh) > 1:
             Image = self._PIL()[0]
-            # 交互中(平移/缩放)用最近邻换取流畅, 停止后 220ms 自动重渲清晰版
-            crop = crop.resize((dw, dh),
+            # 只重采样覆盖率 -> 不会出现 RGBA 未预乘导致的黑边/发灰
+            mask = mask.resize((dw, dh),
                                Image.NEAREST if self._interactive else Image.BILINEAR)
-        # 尺寸差 ≤1px 时直接 1:1 合成 (平移流畅的关键: 免每帧重采样)
-        canvas_img.alpha_composite(crop, (cx0, cy0))
+        solid = ly.solid
+        if solid is None or solid.size != ly.base_img.size:
+            Image = self._PIL()[0]
+            solid = ly.solid = Image.new("RGB", ly.base_img.size, _hex_rgb(ly.color))
+        # 尺寸差 <=1px 时直接 1:1 贴图 (平移流畅的关键: 免每帧重采样)
+        canvas_img.paste(solid.crop((0, 0, dw, dh)), (cx0, cy0), mask)
 
     def _draw_placeholder(self, canvas_img, ly):
         b = ly.bbox()
