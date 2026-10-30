@@ -81,7 +81,45 @@ def apply_icon(root) -> None:
                                                # 绝不能因为它导致程序启动崩溃
 
 
+def _selftest(files):
+    """无界面自检: 解析指定文件并把后端/耗时写到 exe 旁的 selftest.txt
+
+    用法: Evan_Gerber_View.exe --selftest a.gbr b.gbr
+    """
+    import time
+    lines = []
+    try:
+        import gerber_native as _n
+        lines.append("native=%s (%s)" % (_n.available(), _n.status()[1] or "ok"))
+    except Exception as exc:                       # noqa: BLE001
+        lines.append("native 加载失败: %s" % exc)
+    import gerber_reader
+    for p in files:
+        t0 = time.perf_counter()
+        d = gerber_reader.parse_gerber(p)
+        dt = (time.perf_counter() - t0) * 1000.0
+        tag = "?"
+        try:
+            import gerber_native as _n2
+            t1 = time.perf_counter()
+            nd = _n2.parse(p, None)
+            tag = ("NATIVE %.1fms" % ((time.perf_counter() - t1) * 1000.0)) \
+                if nd is not None else ("fallback(%s)" % _n2._LAST)
+        except Exception as exc:                   # noqa: BLE001
+            tag = "err %s" % exc
+        lines.append("%-24s %7.1f ms  prims=%-7d %-18s bbox=%s" % (
+            os.path.basename(p), dt, d.get("feature_count"), tag, d.get("bbox")))
+    out = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                       "selftest.txt")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def main():
+    if "--selftest" in sys.argv:
+        _selftest([a for a in sys.argv[1:] if a != "--selftest"])
+        return
+
     # ---- 启动前的“平台初始化”：必须在创建 Tk() 之前完成 ----
     try:
         # Windows 下声明 DPI 感知，否则高分屏上窗口/字体被系统拉伸、发虚
@@ -110,6 +148,17 @@ def main():
     apply_icon(root)               # 设置标题栏/任务栏图标（内部已静默容错）
 
     viewer = GerberViewer(root)    # 构建查看器：内部会基于 root 创建自己的 Toplevel（win）
+
+    # 命令行 / 右键“打开方式” / 拖到 exe 上：把传入的文件直接加进来
+    _files = [a for a in sys.argv[1:] if os.path.isfile(a)]
+    if _files:
+        def _open_argv():
+            for _i, _p in enumerate(_files):
+                try:
+                    viewer.add_layer(_p, fit_now=(_i == len(_files) - 1))
+                except Exception:      # noqa: BLE001
+                    pass
+        viewer.win.after(60, _open_argv)
 
     def _close():
         """关闭查看器窗口时同时退出程序"""

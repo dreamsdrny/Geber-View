@@ -1,0 +1,17 @@
+[package]
+name = "gerber_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gerber_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

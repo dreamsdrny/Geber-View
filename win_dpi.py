@@ -1,5 +1,5 @@
 """
-Evan_DFM: Windows 高 DPI 支持
+Evan Gerber View: Windows 高 DPI 支持
 =============================================
 解决程序在高 DPI 显示器上「模糊」的问题:
   - 开启 Per-Monitor V2 DPI 感知 (在创建窗口前调用), 使 Windows 不再位图拉伸
@@ -9,7 +9,7 @@ Evan_DFM: Windows 高 DPI 支持
 import ctypes
 import sys
 
-APP_USER_MODEL_ID = "Evan.DFM.App"
+APP_USER_MODEL_ID = "Evan.Gerber.View.App"
 
 
 def enable_dpi_awareness() -> None:

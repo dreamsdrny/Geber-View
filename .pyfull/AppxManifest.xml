@@ -1,0 +1,123 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<Package IgnorableNamespaces="desktop4 desktop6" xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4" xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" xmlns:rescap4="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities/4" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3" xmlns:uap4="http://schemas.microsoft.com/appx/manifest/uap/windows10/4" xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5" xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest">
+  <Identity Name="PythonSoftwareFoundation.Python.3.12" Version="3.12.2800.0" Publisher="CN=4975D53F-AA7E-49A5-8B49-EA4FDC1BB66B" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>Python 3.12</DisplayName>
+    <PublisherDisplayName>Python Software Foundation</PublisherDisplayName>
+    <Description>The Python 3.12 runtime and console.</Description>
+    <Logo>_resources/pythonx50.png</Logo>
+    <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+  </Properties>
+  <Resources>
+    <Resource Language="en-US" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22000.0" />
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+    <uap4:CustomCapability Name="Microsoft.classicAppCompat_8wekyb3d8bbwe" />
+  </Capabilities>
+  <Applications>
+    <Application Id="Python" Executable="python3.12.exe" EntryPoint="Windows.FullTrustApplication" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements DisplayName="Python 3.12" Description="Python interactive console" Square150x150Logo="_resources/pythonx150.png" Square44x44Logo="_resources/pythonx44.png" BackgroundColor="transparent" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console">
+            <uap5:ExecutionAlias Alias="python.exe" />
+            <uap5:ExecutionAlias Alias="python3.exe" />
+            <uap5:ExecutionAlias Alias="python3.12.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+        <uap3:Extension Category="windows.fileTypeAssociation">
+          <uap3:FileTypeAssociation Name="python.file" Parameters="&quot;%1&quot; %*">
+            <uap:DisplayName>Python File</uap:DisplayName>
+            <uap:Logo>_resources/py.png</uap:Logo>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.py</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap3:FileTypeAssociation>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+    <Application Id="PythonW" Executable="pythonw3.12.exe" EntryPoint="Windows.FullTrustApplication" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements DisplayName="Python 3.12 (Windowed)" Description="Python windowed app launcher" Square150x150Logo="_resources/pythonwx150.png" Square44x44Logo="_resources/pythonwx44.png" BackgroundColor="transparent" AppListEntry="none" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias desktop4:Subsystem="windows">
+            <uap5:ExecutionAlias Alias="pythonw.exe" />
+            <uap5:ExecutionAlias Alias="pythonw3.exe" />
+            <uap5:ExecutionAlias Alias="pythonw3.12.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+        <uap3:Extension Category="windows.fileTypeAssociation">
+          <uap3:FileTypeAssociation Name="python.windowedfile" Parameters="&quot;%1&quot; %*">
+            <uap:DisplayName>Python File (no console)</uap:DisplayName>
+            <uap:Logo>_resources/py.png</uap:Logo>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.pyw</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap3:FileTypeAssociation>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+    <Application Id="Pip" Executable="pip3.12.exe" EntryPoint="Windows.FullTrustApplication" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements DisplayName="pip (Python 3.12)" Description="pip package manager for Python 3.12" Square150x150Logo="_resources/pythonx150.png" Square44x44Logo="_resources/pythonx44.png" BackgroundColor="transparent" AppListEntry="none" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console">
+            <uap5:ExecutionAlias Alias="pip.exe" />
+            <uap5:ExecutionAlias Alias="pip3.exe" />
+            <uap5:ExecutionAlias Alias="pip3.12.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+        <uap3:Extension Category="windows.fileTypeAssociation">
+          <uap3:FileTypeAssociation Name="python.wheel" Parameters="install &quot;%1&quot;">
+            <uap:DisplayName>Python Wheel</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.whl</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap3:FileTypeAssociation>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+    <Application Id="Idle" Executable="idle3.12.exe" EntryPoint="Windows.FullTrustApplication" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements DisplayName="IDLE (Python 3.12)" Description="IDLE editor for Python 3.12" Square150x150Logo="_resources/idlex150.png" Square44x44Logo="_resources/idlex44.png" BackgroundColor="transparent" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias desktop4:Subsystem="windows">
+            <uap5:ExecutionAlias Alias="idle.exe" />
+            <uap5:ExecutionAlias Alias="idle3.exe" />
+            <uap5:ExecutionAlias Alias="idle3.12.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Extensions>
+    <rescap4:Extension Category="windows.classicAppCompatKeys" EntryPoint="Windows.FullTrustApplication">
+      <rescap4:ClassicAppCompatKeys>
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12" ValueName="DisplayName" Value="Python 3.12" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12" ValueName="SupportUrl" Value="https://www.python.org/" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12" ValueName="SysArchitecture" Value="64bit" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12" ValueName="SysVersion" Value="3.12" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12" ValueName="Version" Value="3.12.10" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\InstallPath" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\InstallPath" ValueName="" Value="[{AppVPackageRoot}]" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\InstallPath" ValueName="ExecutablePath" Value="[{AppVPackageRoot}]\python3.12.exe" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\InstallPath" ValueName="WindowedExecutablePath" Value="[{AppVPackageRoot}]\pythonw3.12.exe" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\Help" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\Help\Online Python Documentation" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\Help\Online Python Documentation" ValueName="" Value="https://docs.python.org/3.12" ValueType="REG_SZ" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\Idle" />
+        <rescap4:ClassicAppCompatKey Name="HKCU\Software\Python\PythonCore\3.12\Idle" ValueName="" Value="[{AppVPackageRoot}]\Lib\idlelib\idle.pyw" ValueType="REG_SZ" />
+      </rescap4:ClassicAppCompatKeys>
+    </rescap4:Extension>
+  </Extensions>
+  <mp:PhoneIdentity PhoneProductId="e22c2170-4a3d-4264-a1d0-2ed9144068bd" PhonePublisherId="21a62791-35d3-448c-8fa1-256a30e95992" />
+</Package>

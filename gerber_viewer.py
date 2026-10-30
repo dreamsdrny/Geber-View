@@ -1,12 +1,14 @@
 """
-Evan_DFM: Gerber 查看器 (KiCad 风格) + 多层 A/B 叠加对比 + 自动差异定位
+Evan Gerber View: Gerber 查看器 (KiCad 风格) + 多层 A/B 叠加对比 + 自动差异定位
 =========================================================================
 功能:
   - 导入多个 Gerber / 钻孔 (线路/阻焊/丝印/钻孔等), 按【层类型】自动分配不同颜色
   - 缩放(滚轮)/平移(右键拖动)/适应窗口; 选中图层可单独拖动对齐
   - 多层 A/B 对比: A/B 各可导入【多层】(多文件或整个目录), 自动按中心对齐
   - 自动定位差异: 栅格化 A/B 材料 mask 做 XOR, 输出差异位置(XY)+信息, 图上高亮
-  - 导出 PNG
+  - 网络高亮: 画布双击焊盘/走线 -> 高亮整条网络 (读 %TO.N/%TO.P 属性)
+  - 单层 Solo 隔离、测距/测角度、导出 PNG
+  - (原 DFM 检查/报告功能已整体移除, 不再有相关入口)
 
 性能 (针对卡顿/残影/死机的重构):
   - 解析在【后台线程】, 导入大文件不冻结界面
@@ -21,11 +23,20 @@ import math
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from gerber_reader import parse_gerber, parse_excellon
 from branding import win_title
+
+def _outside(pts, clip, margin=0):
+    """折线/多边形是否完全落在裁剪矩形之外"""
+    xs = [q[0] for q in pts]
+    ys = [q[1] for q in pts]
+    return (max(xs) + margin < clip[0] or min(xs) - margin > clip[2]
+            or max(ys) + margin < clip[1] or min(ys) - margin > clip[3])
+
 
 # ---------------- 颜色方案 ----------------
 _PALETTE = ["#e53935", "#1e88e5", "#43a047", "#fb8c00", "#8e24aa",
@@ -52,13 +63,14 @@ _COPPER_INNER = ["#3fb54a", "#b06ad1", "#e0a02f", "#1fb3a6",
 _WARM = ["#ff4d4f", "#ff9f43", "#ffd166", "#ef476f", "#f78c6b", "#e63946", "#ff8fab", "#fb8500"]
 _COOL = ["#3fa9ff", "#06d6a0", "#4cc9f0", "#5b8def", "#00b4d8", "#48cae4", "#2ec4b6", "#4361ee"]
 
+HL_RGB = (255, 214, 10)          # 网络高亮色
 BG_RGB = (15, 17, 21)
 # 每层缓存改为 [L 灰度掩膜 + 固定颜色] 而不是 RGBA:
 #   - 合成时只重采样覆盖率, 不会把透明区的黑色混进边缘 (RGBA 未预乘会产生黑边/发灰)
 #   - 1 字节/像素, 同样内存预算下分辨率可以更高 -> 放大时更清晰
-MAX_BASE = 3200          # 单层缓存位图最长边上限 (px)
+MAX_BASE = 4096          # 单层缓存位图最长边上限 (px)
 QUALITY = 1.0            # 缓存位图按显示比例渲染 -> 静止时合成可 1:1 免重采样 (平移更流畅)
-SS_MAX_PIXELS = 8_000_000  # 最终位图不超过该像素数时按 2x 超采样绘制 (抗锯齿)
+SS_MAX_PIXELS = 4_500_000  # 最终位图不超过该像素数时按 2× 超采样绘制 (抗锯齿)
 DIFF_PX = 1500           # 差异栅格化最长边 (px)
 DIFF_GRID = 200          # 差异定位网格 (每边单元数)
 DIFF_THRESH = 0.28       # 单元覆盖率差阈值 -> 判为差异
@@ -90,6 +102,152 @@ def _hex_rgb(h):
         return (47, 126, 216)
 
 
+class _GridIndex:
+    """均匀网格索引: 图元按包围盒放进相交的格子
+
+    用途: (1) 深放大时只取视口附近的候选图元; (2) 点选焊盘做命中测试。
+    内存: 索引项 array('i'), 总量与图元数同量级 (每图元 1~2 项)。
+    """
+
+    __slots__ = ("x0", "y0", "cw", "ch", "nx", "ny", "off", "items",
+                 "n", "seen", "gen")
+
+    def __init__(self, store, data, bbox, target_per_cell=3.0):
+        import array
+
+        x0, y0, x1, y1 = bbox
+        self.x0, self.y0 = x0, y0
+        self.n = store.n
+        w = max(x1 - x0, 1e-6)
+        h = max(y1 - y0, 1e-6)
+        n = max(1, store.n)
+        cells = max(1, int(n / max(target_per_cell, 1e-6)))
+        # 按长短边分配格数, 保持格子接近正方形
+        nx = max(1, min(1024, int(math.sqrt(cells * w / h) + 0.5)))
+        ny = max(1, min(1024, int(cells / nx + 0.5)))
+        self.nx, self.ny = nx, ny
+        self.cw = w / nx
+        self.ch = h / ny
+
+        # 光圈最大尺寸 (flash 的包围盒要用)
+        ap_max = {}
+        for code, ap in (data.get("apertures") or {}).items():
+            params = [v for v in (ap.get("params") or [])
+                      if isinstance(v, (int, float))]
+            if params:
+                ap_max[code] = max(abs(params[0]), abs(params[1]) if len(params) > 1 else 0.0) \
+                    * (25.4 if data.get("unit") == "inch" else 1.0)
+        rec = store.rec
+        extras = store.extras
+
+        boxes = array.array("f")
+        counts = array.array("i", bytes(4 * nx * ny))
+        for i in range(n):
+            b = i * 9
+            bb = _prim_bbox(rec, b, extras, i, ap_max)
+            if bb is None:
+                boxes.extend((0.0, 0.0, -1.0, -1.0))
+                continue
+            boxes.extend(bb)
+            for cy in range(self._c0(bb[1], self.y0, self.ch, ny),
+                            self._c1(bb[3], self.y0, self.ch, ny) + 1):
+                row = cy * nx
+                for cx in range(self._c0(bb[0], self.x0, self.cw, nx),
+                                self._c1(bb[2], self.x0, self.cw, nx) + 1):
+                    counts[row + cx] += 1
+
+        off = array.array("i", bytes(4 * (nx * ny + 1)))
+        total = 0
+        for c in range(nx * ny):
+            off[c] = total
+            total += counts[c]
+        off[nx * ny] = total
+        items = array.array("i", bytes(4 * total))
+        cur = array.array("i", off)
+        for i in range(n):
+            k = i * 4
+            if boxes[k + 2] < boxes[k]:
+                continue
+            for cy in range(self._c0(boxes[k + 1], self.y0, self.ch, ny),
+                            self._c1(boxes[k + 3], self.y0, self.ch, ny) + 1):
+                row = cy * nx
+                for cx in range(self._c0(boxes[k], self.x0, self.cw, nx),
+                                self._c1(boxes[k + 2], self.x0, self.cw, nx) + 1):
+                    c = row + cx
+                    items[cur[c]] = i
+                    cur[c] += 1
+        self.off = off
+        self.items = items
+        self.seen = array.array("i", bytes(4 * n))
+        self.gen = 0
+
+    @staticmethod
+    def _c0(v, base, size, cnt):
+        c = int((v - base) / size)
+        return 0 if c < 0 else (cnt - 1 if c >= cnt else c)
+
+    @staticmethod
+    def _c1(v, base, size, cnt):
+        return _GridIndex._c0(v, base, size, cnt)
+
+    def query(self, rx0, ry0, rx1, ry1):
+        """返回与矩形相交的图元序号 (升序, 保持绘制顺序); 矩形极大时返回 None"""
+        if self.n <= 0:
+            return []
+        gx0 = self._c0(min(rx0, rx1), self.x0, self.cw, self.nx)
+        gx1 = self._c0(max(rx0, rx1), self.x0, self.cw, self.nx)
+        gy0 = self._c0(min(ry0, ry1), self.y0, self.ch, self.ny)
+        gy1 = self._c0(max(ry0, ry1), self.y0, self.ch, self.ny)
+        # 覆盖面积接近全层时没必要走索引
+        if (gx1 - gx0 + 1) * (gy1 - gy0 + 1) >= self.nx * self.ny * 0.6:
+            return None
+        seen = self.seen
+        gen = self.gen + 1
+        self.gen = gen
+        items = self.items
+        off = self.off
+        nx = self.nx
+        out = []
+        ap = out.append
+        for cy in range(gy0, gy1 + 1):
+            row = cy * nx
+            for cx in range(gx0, gx1 + 1):
+                c = row + cx
+                for k in range(off[c], off[c + 1]):
+                    i = items[k]
+                    if seen[i] != gen:
+                        seen[i] = gen
+                        ap(i)
+        out.sort()
+        return out
+
+
+def _prim_bbox(rec, b, extras, i, ap_max):
+    """图元的包围盒 (本地坐标, 已含线宽/焊盘尺寸), 供建索引与命中测试"""
+    code = int(rec[b])
+    t = code & 7
+    x1 = rec[b + 1]; y1 = rec[b + 2]
+    x2 = rec[b + 3]; y2 = rec[b + 4]
+    wd = rec[b + 5]
+    if t == 1:
+        r = ap_max.get(int(rec[b + 6]), max(wd, 0.2)) * 0.5 + 0.05
+        return (x1 - r, y1 - r, x1 + r, y1 + r)
+    if t == 2:
+        cx = x1 + rec[b + 7]; cy = y1 + rec[b + 8]
+        r = math.hypot(x1 - cx, y1 - cy) + max(wd, 0.0) * 0.5 + 0.05
+        return (cx - r, cy - r, cx + r, cy + r)
+    if t == 3:
+        e = extras.get(i)
+        pts = e[0] if e else None
+        if not pts:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+    r = max(wd, 0.0) * 0.5 + 0.05
+    return (min(x1, x2) - r, min(y1, y2) - r, max(x1, x2) + r, max(y1, y2) + r)
+
+
 class GerberLayer:
     def __init__(self, name, data, color, group=""):
         self.name = name
@@ -111,7 +269,17 @@ class GerberLayer:
         self.token = 0                     # 渲染令牌 (丢弃过期结果)
         self.pending = False               # 是否有在途渲染任务
         self.lru = 0.0
-        self.solid = None                  # 与 base_img 同尺寸的纯色图 (合成时按掩膜贴上去)
+        self.solid = None                  # 遗留字段 (合成已改为直接按颜色贴图)
+        # 高清块: 放大到全层缓存分辨率不够时, 只按当前视口渲染一块 (分辨率=屏幕),
+        # 叠在粗缓存上显示 -> 放大后也是 1:1, 不再靠拉伸。
+        self.detail_img = None
+        self.detail_scale = 0.0            # px / mm
+        self.detail_bbox = None            # 本地(镜像已应用)包围盒
+        self.detail_token = 0
+        self.detail_pending = False
+        self.index = None               # 空间索引 (深放大/点选时按需建)
+        self.index_sig = None
+        self.net_map = None             # 网络名 -> 图元序号 (点选时按需建)
 
     # ---------------- 比例校正 ----------------
     def apply_scale(self, factor, auto=False):
@@ -128,6 +296,9 @@ class GerberLayer:
         self.base_img = None
         self.base_bbox = None
         self.solid = None
+        self.detail_img = None
+        self.detail_token += 1
+        self.detail_pending = False
         self.token += 1
         self.pending = False
 
@@ -142,6 +313,9 @@ class GerberLayer:
         self.base_img = None
         self.base_bbox = None
         self.solid = None
+        self.detail_img = None
+        self.detail_token += 1
+        self.detail_pending = False
         self.token += 1
         self.pending = False
 
@@ -244,6 +418,14 @@ class GerberViewer:
         self._lru_clock = 0.0
         self._frame_scale = None
         self._interactive = False           # 交互中(拖动/平移/缩放) → 用更快但略粗的重采样
+        self._fast_preview = False          # 是否允许用"上一帧整图变换"做预览 (缩放/平移)
+        self._last_img = None               # 上一帧完整合成结果 (不含选中框/标记)
+        self._last_view = None              # 该帧对应的世界范围
+        self._solo = None                   # 单层隔离 (只显示这一层)
+        self._hl = None                     # 网络高亮 {net, items}
+        self._measure_on = False
+        self._measure_pts = []              # 测距点 (mm)
+        self._measure_cur = None
         self._hover_job = None              # 坐标读数节流定时器
         self._hover_xy = None
         self._cfg_job = None                # 窗口尺寸变化防抖定时器
@@ -323,9 +505,15 @@ class GerberViewer:
                         command=lambda: self._auto_check_scales(False, True))
         mb["menu"] = mnu
         mb.pack(side=tk.LEFT, padx=2)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self._measure_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="测距/测角", variable=self._measure_var,
+                        command=self._measure_toggle).pack(side=tk.LEFT)
+        ttk.Button(bar, text="清除高亮", command=self._clear_overlays).pack(side=tk.LEFT, padx=4)
         self.move_mode = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="拖动移动图层", variable=self.move_mode).pack(side=tk.LEFT, padx=6)
-        self.info = tk.StringVar(value="左键拖动=移动选中图层；右键拖动=平移；滚轮=缩放；双击图层名=改颜色")
+        self.info = tk.StringVar(
+            value="左键拖动=移动图层；右键拖动=平移；滚轮=缩放；画布双击=高亮整条网络；Esc=清除")
         ttk.Label(bar, textvariable=self.info, foreground="#555").pack(side=tk.RIGHT)
 
         body = ttk.Frame(self.win)
@@ -340,6 +528,7 @@ class GerberViewer:
         ttk.Button(btnbar, text="开选中", width=6, command=lambda: self._set_sel(True)).pack(side=tk.LEFT)
         ttk.Button(btnbar, text="关选中", width=6, command=lambda: self._set_sel(False)).pack(side=tk.LEFT, padx=2)
         ttk.Button(btnbar, text="反选", width=5, command=self._invert).pack(side=tk.LEFT)
+        ttk.Button(btnbar, text="Solo", width=5, command=self._solo_toggle).pack(side=tk.LEFT, padx=2)
 
         ui = self._ui_scale()
         style = ttk.Style(self.win)
@@ -383,6 +572,10 @@ class GerberViewer:
         self.canvas.bind("<ButtonRelease-3>", self._on_release)
         self.canvas.bind("<Motion>", self._on_hover)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Double-Button-1>", self._highlight_at)
+        self.canvas.bind("<Escape>", self._clear_overlays)
+        self.canvas.bind_all("<Escape>", self._clear_overlays)
+        self.canvas.bind("<Motion>", self._on_motion_measure, add="+")
 
         self.status = tk.StringVar(value="Ready")
         ttk.Label(self.win, textvariable=self.status, relief=tk.SUNKEN,
@@ -440,6 +633,18 @@ class GerberViewer:
                     img, scale = self._render_layer_bitmap(
                         data, kind, lb, mirror, color, target)
                     self._ui_q.put(("base", token, img, scale, tuple(lb)))
+                elif kindjob == "detail":
+                    _, _ly, token, data, kind, lb, mirror, color, target = job
+                    # 期间又缩放过 -> 直接丢弃 (不清 pending: 那可能已经是新请求的)
+                    if _ly.detail_token != token:
+                        continue
+                    idx = self._layer_index(_ly)
+                    img, scale = self._render_layer_bitmap(
+                        data, kind, lb, mirror, color, target, clamp=False,
+                        index=idx)
+                    if _ly.detail_token != token:
+                        continue
+                    self._ui_q.put(("detail", token, img, scale, tuple(lb)))
                 elif kindjob == "diff":
                     _, payload = job
                     res = self._compute_diff(payload)
@@ -498,6 +703,16 @@ class GerberViewer:
                     ly.pending = False
                     self._lru_clock += 1
                     ly.lru = self._lru_clock
+                    break
+            self._schedule_render()
+        elif t == "detail":
+            _, token, img, scale, lb = msg
+            for ly in self.layers:
+                if ly.detail_token == token and ly.detail_pending:
+                    ly.detail_img = img
+                    ly.detail_scale = scale
+                    ly.detail_bbox = list(lb)
+                    ly.detail_pending = False
                     break
             self._schedule_render()
         elif t == "diff":
@@ -708,6 +923,7 @@ class GerberViewer:
             return
         ly.color = hexc
         ly.solid = None
+        ly.detail_img = None
         self._invalidate(ly)          # 颜色已烘焙进位图 → 需重渲
         self._refresh_list()
         self.info.set(f"{ly.name}: 颜色已改为 {hexc}")
@@ -854,8 +1070,12 @@ class GerberViewer:
             self._schedule_render()
 
     def _invalidate(self, ly):
+        self._last_img = None
         ly.base_img = None
         ly.solid = None
+        ly.detail_img = None
+        ly.detail_token += 1
+        ly.detail_pending = False
         ly.token += 1
         ly.pending = False
         if ly.visible:
@@ -1087,7 +1307,11 @@ class GerberViewer:
         self._recompute_view_bbox()
         self.zoom = 1.0
         self.pan = [0.0, 0.0]
+        self._last_img = None
         for ly in self.layers:
+            ly.detail_img = None
+            ly.detail_pending = False
+            ly.detail_token += 1
             if ly.visible:
                 self._request_base(ly)
         self._schedule_render()
@@ -1100,6 +1324,7 @@ class GerberViewer:
         wx = wy = None
         if px is not None and py is not None:
             wx, wy = self._canvas_to_mm(px, py)      # 缩放前光标下的世界坐标
+        self._fast_preview = True
         self.zoom = max(0.02, min(self.zoom * factor, 400.0))
         if wx is not None:
             s, minx, miny, maxx, maxy, W, H = self._scale()
@@ -1121,22 +1346,32 @@ class GerberViewer:
             if ly.visible:
                 self._request_base(ly)
         self._schedule_render()
+        self._schedule_settle()
 
     def _on_canvas_configure(self, _event):
-        """窗口尺寸变化: 防抖, 避免拖动窗口边缘时每帧全量重合成"""
+        """窗口尺寸变化: 先立刻重画, 再防抖地重建缓存。
+
+        原来要等 120ms 才画, 期间旧图仍按老尺寸贴在左上角, 看起来就是
+        "窗口变大以后四周的图形消失了"。
+        """
+        self._schedule_render()
         if self._cfg_job is not None:
             try:
                 self.win.after_cancel(self._cfg_job)
             except Exception:  # noqa: BLE001
                 pass
         try:
-            self._cfg_job = self.win.after(120, self._do_resize_render)
+            self._cfg_job = self.win.after(250, self._do_resize_render)
         except Exception:  # noqa: BLE001
             self._cfg_job = None
 
     def _do_resize_render(self):
         self._cfg_job = None
-        self._schedule_render()
+        for ly in self.layers:
+            ly.detail_img = None          # 视口变了 -> 高清块作废, 等重新渲染
+            ly.detail_pending = False
+            ly.detail_token += 1
+        self._schedule_settle()
 
     def _schedule_render(self):
         if self._render_job is not None:
@@ -1173,20 +1408,33 @@ class GerberViewer:
     def _do_settle(self):
         self._settle_job = None
         self._interactive = False
+        self._fast_preview = False
         for ly in self.layers:
-            if ly.visible:
-                self._request_base(ly)
+            if not self._layer_on(ly):
+                continue
+            self._request_base(ly)
+            self._request_detail(ly)      # 放大时补一块屏幕分辨率的高清图
         self._schedule_render()
 
     # ---------------- 交互 ----------------
     def _on_press(self, event):
+        if self._measure_on:
+            self._measure_click(event)
+            return
         if not getattr(self, "move_mode", None) or not self.move_mode.get():
             self._pan_start(event)
             return
+        self._fast_preview = False          # 拖图层要看到层真的动, 不能用预览
         self._drag = {"mode": "layer", "px": event.x, "py": event.y}
         ly = self._sel_layer()
         if ly:
             self._drag["ox"], self._drag["oy"] = ly.offset
+
+    def _on_motion_measure(self, event):
+        if not self._measure_on or not self._measure_pts:
+            return
+        self._measure_cur = self._canvas_to_mm(event.x, event.y)
+        self._refresh_measure()
 
     def _on_motion(self, event):
         if not self._drag or self._drag["mode"] != "layer":
@@ -1216,6 +1464,7 @@ class GerberViewer:
             self.pan = [self._drag["ox"] + (event.x - self._drag["px"]),
                         self._drag["oy"] + (event.y - self._drag["py"])]
             self._interactive = True
+            self._fast_preview = True
             self._schedule_render()
 
     def _on_hover(self, event):
@@ -1235,6 +1484,68 @@ class GerberViewer:
         self.status.set(f"X={x:.3f}mm  Y={y:.3f}mm   (mil: {x*39.3701:.1f} x {y*39.3701:.1f})")
 
     # ---------------- 位图缓存请求 ----------------
+    def _viewport_world(self, pad=0.12):
+        """当前视口对应的世界坐标范围 (四周外扩一点, 小距离平移不必立刻重渲)"""
+        s = self._scale()[0]
+        if not s or s <= 0:
+            return None
+        x0, y0 = self._canvas_to_mm(0, 0)
+        x1, y1 = self._canvas_to_mm(self.canvas.winfo_width(), self.canvas.winfo_height())
+        lox, hix = min(x0, x1), max(x0, x1)
+        loy, hiy = min(y0, y1), max(y0, y1)
+        pw = (hix - lox) * pad
+        ph = (hiy - loy) * pad
+        return (lox - pw, loy - ph, hix + pw, hiy + ph)
+
+    def _layer_index(self, ly):
+        """按需建空间索引 (图层大才建; 重建过的比例校正会使它失效)"""
+        data = ly.data or {}
+        store = data.get("primitives")
+        if store is None or getattr(store, "n", 0) < 20000:
+            return None                      # 图元少, 线性扫更快
+        sig = (store.n, round(ly.scale_factor or 1.0, 6))
+        if ly.index is not None and ly.index_sig == sig:
+            return ly.index
+        lb = ly.local_bbox()
+        if not lb:
+            return None
+        try:
+            ly.index = _GridIndex(store, data, lb)
+            ly.index_sig = sig
+        except Exception:                    # noqa: BLE001
+            ly.index = None
+            return None
+        return ly.index
+
+    def _request_detail(self, ly):
+        """按当前视口 + 屏幕分辨率渲染一块高清位图 (只在放大超过缓存能力时才做)"""
+        if not self._layer_on(ly) or not ly.data or ly.base_img is None \
+                or ly.base_scale <= 0:
+            return
+        s = self._scale()[0]
+        if not s or s <= ly.base_scale * 1.12:
+            return                          # 缓存已经够清晰
+        vw = self._viewport_world()
+        lb = ly.local_bbox()
+        if not vw or not lb:
+            return
+        ox, oy = ly.offset
+        x0 = max(vw[0] - ox, lb[0]); x1 = min(vw[2] - ox, lb[2])
+        y0 = max(vw[1] - oy, lb[1]); y1 = min(vw[3] - oy, lb[3])
+        if x1 - x0 <= 1e-9 or y1 - y0 <= 1e-9:
+            return                          # 该层不在视口内
+        bb = ly.detail_bbox
+        if (bb and ly.detail_scale > 0
+                and abs(ly.detail_scale - s) / max(s, 1e-9) < 0.06
+                and x0 >= bb[0] and y0 >= bb[1] and x1 <= bb[2] and y1 <= bb[3]):
+            return                          # 现有高清块仍然覆盖
+        if ly.detail_pending:
+            return
+        ly.detail_token += 1
+        ly.detail_pending = True
+        self._render_q.put(("detail", ly, ly.detail_token, ly.data, ly.kind,
+                            [x0, y0, x1, y1], ly.mirror_x, ly.color, s))
+
     def _request_base(self, ly):
         lb = ly.local_bbox()
         if not lb:
@@ -1246,11 +1557,15 @@ class GerberViewer:
         # L 掩膜 1 字节/像素, 每层可用像素数 = 预算/层数 -> 层多时分辨率也不至于塌掉
         cap = int(math.sqrt(max(1.0, BUDGET_BYTES / vis)))
         cap = max(1200, min(MAX_BASE, cap))
-        target = min(s * QUALITY, cap / max(w, h))
+        hard_cap = cap / max(w, h)          # 全层位图的物理分辨率上限 (px/mm)
+        target = min(s * QUALITY, hard_cap)
         if ly.pending:
             return
         if ly.base_img is not None and ly.base_scale > 0:
-            if abs(ly.base_scale - target) / max(target, 1e-6) < 0.30:
+            # 已经到上限: 放大时靠 detail 块补清晰度, 不再每次缩放都重光栅化整层
+            if ly.base_scale >= hard_cap * 0.98:
+                return
+            if abs(ly.base_scale - target) / max(target, 1e-6) < 0.55:
                 return
         ly.token += 1
         ly.pending = True
@@ -1258,102 +1573,155 @@ class GerberViewer:
                             ly.mirror_x, ly.color, target))
 
     # ---------------- 纯渲染 (后台线程安全, 不触碰 Tk) ----------------
-    def _ap_shape_data(self, data, p):
+    def _ap_shape_data(self, data, ap_code, width):
         aps = data.get("apertures") or {}
-        ap = aps.get(p.get("aperture"))
+        ap = aps.get(ap_code)
         scale = 25.4 if data.get("unit") == "inch" else 1.0
-        # 无光圈定义 或 光圈为自定义宏(已在解析时展开, 图元自带 mm 线宽/直径)
+        # 无光圈定义 或 自定义宏光圈(解析时已展开, 图元自带 mm 直径)
         if not ap or ap.get("macro"):
-            w = p.get("width") or 0.2
+            w = width or 0.2
             return ("C", w, w, 0, 0.0)
         shape = str(ap.get("shape", "C"))
         params = [x for x in (ap.get("params") or []) if isinstance(x, (int, float))]
         if shape == "C" or not params:
-            w = (params[0] if params else (p.get("width") or 0.2) / max(scale, 1e-9)) * scale
+            w = (params[0] if params else (width or 0.2) / max(scale, 1e-9)) * scale
             return ("C", w, w, 0, 0.0)
         if shape == "R":
-            w = params[0] * scale
-            h = (params[1] if len(params) > 1 else params[0]) * scale
-            return ("R", w, h, 0, 0.0)
+            return ("R", params[0] * scale,
+                    (params[1] if len(params) > 1 else params[0]) * scale, 0, 0.0)
         if shape == "O":
-            w = params[0] * scale
-            h = (params[1] if len(params) > 1 else params[0]) * scale
-            return ("O", w, h, 0, 0.0)
+            return ("O", params[0] * scale,
+                    (params[1] if len(params) > 1 else params[0]) * scale, 0, 0.0)
         if shape == "P":
             d = params[0] * scale
             edges = int(params[1]) if len(params) > 1 else 5
             rot = params[2] if len(params) > 2 else 0.0
             return ("P", d, d, edges, rot)
-        return ("C", (params[0] * scale if params else 0.2), 0, 0, 0.0)
+        return ("C", params[0] * scale if params else 0.2, 0, 0, 0.0)
 
-    def _arc_points(self, p, seg=16):
-        x1, y1, x2, y2 = p.get("x1"), p.get("y1"), p.get("x2"), p.get("y2")
-        i, j = p.get("i", 0.0), p.get("j", 0.0)
+    @staticmethod
+    def _arc_segs(r_px):
+        """按屏幕半径决定圆弧段数 (固定 16 段在深放大时会变成可见折线)"""
+        r = max(abs(r_px), 0.3)
+        c = 1.0 - 0.3 / r                      # 弦高 <= 0.3px
+        if c <= -1.0:
+            return 6
+        try:
+            seg = int(math.pi / max(math.acos(c), 1e-6))
+        except (ValueError, ZeroDivisionError):
+            return 16
+        return max(6, min(512, seg))
+
+    def _arc_points(self, x1, y1, x2, y2, i, j, cw, seg=None, scale=1.0):
         cx, cy = x1 + i, y1 + j
         r = math.hypot(x1 - cx, y1 - cy)
+        if seg is None:
+            seg = self._arc_segs(r * (scale or 1.0))
         a1 = math.atan2(y1 - cy, x1 - cx)
         a2 = math.atan2(y2 - cy, x2 - cx)
-        if p.get("cw"):
+        if cw:
             while a2 > a1:
                 a2 -= 2 * math.pi
         else:
             while a2 < a1:
                 a2 += 2 * math.pi
-        return [(cx + r * math.cos(a1 + (a2 - a1) * k / seg),
-                 cy + r * math.sin(a1 + (a2 - a1) * k / seg)) for k in range(seg + 1)]
+        n = int(seg)
+        d = (a2 - a1) / n
+        return [(cx + r * math.cos(a1 + d * k), cy + r * math.sin(a1 + d * k))
+                for k in range(n + 1)]
 
-    def _draw_prims(self, draw, data, kind, T, scale, fill, clear_fill, ap_cache=None):
-        for p in (data.get("primitives") or data.get("features") or []):
-            t = p.get("type")
-            if t == "error" or p.get("x1") is None:
-                continue
-            c = clear_fill if p.get("clear") else fill
-            if t == "flash":
-                acode = p.get("aperture")
-                if ap_cache is not None and acode in ap_cache:
-                    shape, fw, fh, edges, rot = ap_cache[acode]
-                else:
-                    shape, fw, fh, edges, rot = self._ap_shape_data(data, p)
-                    if ap_cache is not None:
-                        ap_cache[acode] = (shape, fw, fh, edges, rot)
-                cx, cy = T(p["x1"], p["y1"])
-                if shape == "R":
-                    hw, hh = fw / 2 * scale, fh / 2 * scale
-                    draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh], fill=c)
-                elif shape == "O":
-                    hw, hh = fw / 2 * scale, fh / 2 * scale
-                    rr = min(hw, hh)
-                    if fw >= fh:
-                        draw.ellipse([cx - hw, cy - hh, cx - hw + 2 * rr, cy + hh], fill=c)
-                        draw.ellipse([cx + hw - 2 * rr, cy - hh, cx + hw, cy + hh], fill=c)
-                        draw.rectangle([cx - hw + rr, cy - hh, cx + hw - rr, cy + hh], fill=c)
+    def _draw_prims(self, draw, data, kind, T, scale, fill, clear_fill,
+                    ap_cache=None, clip=None, indices=None):
+        """把一层图元画进 draw。
+
+        clip=(x0,y0,x1,y1): 跳过完全在视口外的图元 (深放大时 95% 在屏幕外)
+        indices: 只画这些图元序号 (空间索引给的候选), 传入时不再遍历全层
+        """
+        store = data.get("primitives")
+        if store is not None and getattr(store, "n", 0):
+            rec = store.rec
+            extras = store.extras
+            rng = range(store.n) if indices is None else indices
+            cnt = 0
+            for i in rng:
+                cnt += 1
+                if not cnt & 1023:
+                    time.sleep(0)          # 定期让出 GIL: 后台重渲时界面不僵
+                b = i * 9
+                code = int(rec[b])
+                if code == 4:                              # 解析错误占位
+                    continue
+                c = clear_fill if (code & 8) else fill
+                t = code & 7
+                x1 = rec[b + 1]; y1 = rec[b + 2]
+                x2 = rec[b + 3]; y2 = rec[b + 4]
+                wd = rec[b + 5]
+                ap = int(rec[b + 6])
+                if t == 1:                                 # flash
+                    if ap_cache is not None and ap in ap_cache:
+                        shape, fw, fh, edges, rot = ap_cache[ap]
                     else:
-                        draw.ellipse([cx - hw, cy - hh, cx + hw, cy - hh + 2 * rr], fill=c)
-                        draw.ellipse([cx - hw, cy + hh - 2 * rr, cx + hw, cy + hh], fill=c)
-                        draw.rectangle([cx - hw, cy - hh + rr, cx + hw, cy + hh - rr], fill=c)
-                elif shape == "P" and edges >= 3:
-                    r = fw / 2 * scale
-                    pts = [(cx + r * math.cos(math.radians(rot + k * 360.0 / edges)),
-                            cy + r * math.sin(math.radians(rot + k * 360.0 / edges)))
-                           for k in range(edges)]
-                    draw.polygon(pts, fill=c)
-                else:
-                    r = max(0.6, fw / 2 * scale)
-                    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=c)
-            elif t == "arc":
-                pts = [T(px, py) for px, py in self._arc_points(p)]
-                if len(pts) >= 2:
-                    wpx = max(1, int(round((p.get("width") or 0.0) * scale)))
-                    draw.line(pts, fill=c, width=wpx, joint="curve")
-            elif t == "region":
-                pts = [T(px, py) for px, py in p.get("points", [])]
-                if len(pts) >= 3:
-                    draw.polygon(pts, fill=c)
-            else:
-                wpx = max(1, int(round((p.get("width") or 0.0) * scale)))
-                draw.line([T(p["x1"], p["y1"]),
-                           T(p.get("x2", p["x1"]), p.get("y2", p["y1"]))],
-                          fill=c, width=wpx)
+                        shape, fw, fh, edges, rot = self._ap_shape_data(data, ap, wd)
+                        if ap_cache is not None:
+                            ap_cache[ap] = (shape, fw, fh, edges, rot)
+                    cx, cy = T(x1, y1)
+                    if clip is not None:
+                        m = max(fw, fh) / 2 * scale + 2
+                        if (cx + m < clip[0] or cx - m > clip[2]
+                                or cy + m < clip[1] or cy - m > clip[3]):
+                            continue
+                    if shape == "R":
+                        hw, hh = fw / 2 * scale, fh / 2 * scale
+                        draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh], fill=c)
+                    elif shape == "O":
+                        hw, hh = fw / 2 * scale, fh / 2 * scale
+                        rr = min(hw, hh)
+                        if fw >= fh:
+                            draw.ellipse([cx - hw, cy - hh, cx - hw + 2 * rr, cy + hh], fill=c)
+                            draw.ellipse([cx + hw - 2 * rr, cy - hh, cx + hw, cy + hh], fill=c)
+                            draw.rectangle([cx - hw + rr, cy - hh, cx + hw - rr, cy + hh], fill=c)
+                        else:
+                            draw.ellipse([cx - hw, cy - hh, cx + hw, cy - hh + 2 * rr], fill=c)
+                            draw.ellipse([cx - hw, cy + hh - 2 * rr, cx + hw, cy + hh], fill=c)
+                            draw.rectangle([cx - hw, cy - hh + rr, cx + hw, cy + hh - rr], fill=c)
+                    elif shape == "P" and edges >= 3:
+                        r = fw / 2 * scale
+                        pts = [(cx + r * math.cos(math.radians(rot + k * 360.0 / edges)),
+                                cy + r * math.sin(math.radians(rot + k * 360.0 / edges)))
+                               for k in range(edges)]
+                        draw.polygon(pts, fill=c)
+                    else:
+                        r = max(0.6, fw / 2 * scale)
+                        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=c)
+                elif t == 2:                               # arc
+                    pts = [T(px, py) for px, py in self._arc_points(
+                        x1, y1, x2, y2, rec[b + 7], rec[b + 8],
+                        bool(code & 16), scale=scale)]
+                    if len(pts) >= 2:
+                        wpx = max(1, int(round(wd * scale)))
+                        if clip is not None and _outside(pts, clip, wpx + 2):
+                            continue
+                        draw.line(pts, fill=c, width=wpx, joint="curve")
+                elif t == 3:                               # region
+                    e = extras.get(i)
+                    pl = e[0] if e else None
+                    if pl:
+                        pts = [T(px, py) for px, py in pl]
+                        if len(pts) >= 3:
+                            if clip is not None and _outside(pts, clip, 1):
+                                continue
+                            draw.polygon(pts, fill=c)
+                else:                                      # draw
+                    wpx = max(1, int(round(wd * scale)))
+                    a = T(x1, y1)
+                    bb = T(x2, y2)
+                    if clip is not None and (
+                            max(a[0], bb[0]) + wpx < clip[0]
+                            or min(a[0], bb[0]) - wpx > clip[2]
+                            or max(a[1], bb[1]) + wpx < clip[1]
+                            or min(a[1], bb[1]) - wpx > clip[3]):
+                        continue
+                    draw.line([a, bb], fill=c, width=wpx)
         if kind == "drill":
             for hd in (data.get("holes") or []):
                 if hd.get("x") is None:
@@ -1361,6 +1729,9 @@ class GerberViewer:
                 cx, cy = T(hd["x"], hd["y"])
                 dia = hd.get("diameter_mm") or 0.3
                 r = max(0.7, dia / 2 * scale)
+                if clip is not None and (cx + r < clip[0] or cx - r > clip[2]
+                                         or cy + r < clip[1] or cy - r > clip[3]):
+                    continue
                 if hd.get("is_slot") and hd.get("x2") is not None and hd.get("y2") is not None:
                     ex, ey = T(hd["x2"], hd["y2"])
                     draw.line([cx, cy], [ex, ey], fill=fill, width=max(1, int(round(r * 2))))
@@ -1377,7 +1748,8 @@ class GerberViewer:
             return ((lx + ox - minx) * scale, img_h - ((y + oy - miny) * scale))
         return T
 
-    def _render_layer_bitmap(self, data, kind, lb, mirror, color, target_scale):
+    def _render_layer_bitmap(self, data, kind, lb, mirror, color, target_scale,
+                             clamp=True, index=None, indices=None):
         """渲染单层掩膜 (L 灰度): 255 = 该处有图形, 0 = 空白。
 
         抗锯齿: PIL 的 ImageDraw 是硬边, 位图不大时按 2x 超采样绘制再 LANCZOS 降采样,
@@ -1386,7 +1758,9 @@ class GerberViewer:
         Image, ImageDraw, _ = self._PIL()
         minx, miny, maxx, maxy = lb
         w = max(maxx - minx, 1e-6); h = max(maxy - miny, 1e-6)
-        scale = min(target_scale, MAX_BASE / max(w, h))
+        scale = target_scale
+        if clamp:                           # detail 块只覆盖视口, 不受全层尺寸上限约束
+            scale = min(scale, MAX_BASE / max(w, h))
         scale = max(scale, 1e-3)
         W = max(1, int(round(w * scale)) + 1)
         H = max(1, int(round(h * scale)) + 1)
@@ -1395,7 +1769,13 @@ class GerberViewer:
         img = Image.new("L", (dw, dh), 0)
         draw = ImageDraw.Draw(img)
         T = self._make_xform(lb, scale * ss, dh, mirror, (0.0, 0.0))
-        self._draw_prims(draw, data, kind, T, scale * ss, 255, 0, ap_cache={})
+        # detail 块的位图就是视口本身 -> 屏幕外的图元可以直接跳过
+        clip = None if clamp else (0.0, 0.0, float(dw), float(dh))
+        sel = indices
+        if sel is None and index is not None:
+            sel = index.query(lb[0], lb[1], lb[2], lb[3])
+        self._draw_prims(draw, data, kind, T, scale * ss, 255, 0,
+                         ap_cache={}, clip=clip, indices=sel)
         if ss > 1:
             img = img.resize((W, H), Image.LANCZOS)
         return img, scale
@@ -1421,23 +1801,36 @@ class GerberViewer:
             return
         Image, ImageDraw, ImageTk = self._PIL()
         self._frame_scale = self._scale()
-        canvas_img = Image.new("RGBA", (W, H), BG_RGB + (255,))
         sel = self._sel_layer()
         any_pending = False
-        for ly in self.layers:
-            if not ly.visible:
-                continue
-            if ly.base_img is None:
-                if not ly.pending:
-                    self._request_base(ly)
-                any_pending = True
-                self._draw_placeholder(canvas_img, ly)
-                continue
-            self._composite_layer(canvas_img, ly, W, H)
-            self._lru_clock += 1
-            ly.lru = self._lru_clock
+        # 缩放/平移期间直接变换上一帧整图 (一次重采样, ~20ms);
+        # 逐层合成要 170~290ms/帧, 那是滚轮卡顿的根源。
+        canvas_img = None
+        if self._interactive and self._fast_preview:
+            canvas_img = self._preview_canvas(W, H)
+        if canvas_img is None:
+            canvas_img = Image.new("RGBA", (W, H), BG_RGB + (255,))
+            for ly in self.layers:
+                if not self._layer_on(ly):
+                    continue
+                if ly.base_img is None:
+                    if not ly.pending:
+                        self._request_base(ly)
+                    any_pending = True
+                    self._draw_placeholder(canvas_img, ly)
+                    continue
+                self._composite_layer(canvas_img, ly, W, H)
+                self._lru_clock += 1
+                ly.lru = self._lru_clock
+            if not self._interactive:
+                # 快照 (不含选中框/差异标记), 供交互期做预览
+                self._last_img = canvas_img.copy()
+                self._last_view = self._canvas_world_rect(W, H)
+        # 网络高亮: 交互预览帧里跳过 (预览图本身已含高亮, 不必每帧重算)
+        if self._hl and not (self._interactive and self._fast_preview):
+            self._draw_highlight(canvas_img, W, H)
         d = ImageDraw.Draw(canvas_img)
-        if sel is not None and sel.visible:
+        if sel is not None and self._layer_on(sel):
             self._draw_sel_rect(d, sel)
         if self.diff_points:
             self._draw_diff_markers(d)
@@ -1456,42 +1849,114 @@ class GerberViewer:
                 cv.itemconfig(self._img_item, image=self._photo)
         self._frame_scale = None
         self._evict_cache()
+        self._refresh_measure()
+        self._frame_img = canvas_img      # 供调试/回归取最终帧 (含高亮)
         if any_pending:
             self.status.set("渲染中 ... (后台)")
 
-    def _composite_layer(self, canvas_img, ly, W, H):
-        lb = ly.base_bbox or ly.local_bbox()
-        if not lb or ly.base_scale <= 0:
+    def _canvas_world_rect(self, W, H):
+        """画布 (0,0)-(W,H) 对应的世界坐标范围"""
+        x0, y0 = self._canvas_to_mm(0, 0)
+        x1, y1 = self._canvas_to_mm(W, H)
+        return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+    def _preview_canvas(self, W, H):
+        """把上一帧整图按新的缩放/平移变换成当前画面 (单次重采样)"""
+        img = self._last_img
+        vw = self._last_view
+        if img is None or not vw:
+            return None
+        Image = self._PIL()[0]
+        # 上一帧覆盖的世界矩形, 在当前视口里落在哪
+        X0, Y0 = self._to_canvas(vw[0], vw[3])
+        X1, Y1 = self._to_canvas(vw[2], vw[1])
+        sw = X1 - X0; sh = Y1 - Y0
+        if sw <= 0.5 or sh <= 0.5:
+            return None
+        # 只取落在画布内的那部分, 避免深放大时把整图放大到几十万像素
+        fx0 = max(0.0, -X0) / sw; fx1 = min(1.0, (W - X0) / sw)
+        fy0 = max(0.0, -Y0) / sh; fy1 = min(1.0, (H - Y0) / sh)
+        if fx1 - fx0 <= 0.002 or fy1 - fy0 <= 0.002:
+            return None
+        W0, H0 = img.size
+        sx0 = int(fx0 * W0); sx1 = int(fx1 * W0)
+        sy0 = int(fy0 * H0); sy1 = int(fy1 * H0)
+        if sx1 - sx0 < 1 or sy1 - sy0 < 1:
+            return None
+        src = img.crop((sx0, sy0, sx1, sy1))
+        dw = max(1, int(round((fx1 - fx0) * sw)))
+        dh = max(1, int(round((fy1 - fy0) * sh)))
+        if src.size != (dw, dh):
+            src = src.resize((dw, dh), Image.BILINEAR)
+        dx = int(round(X0 + fx0 * sw)); dy = int(round(Y0 + fy0 * sh))
+        canvas_img = Image.new("RGBA", (W, H), BG_RGB + (255,))
+        canvas_img.paste(src, (dx, dy))
+        return canvas_img
+
+    def _blit(self, canvas_img, ly, img, bbox, W, H, color=None):
+        """把一张掩膜按当前视口贴到画布上 (自动裁剪; 上采样用 BICUBIC 保持锐利)
+
+        color 可覆盖本层颜色 (网络高亮用)。
+        """
+        if img is None or not bbox:
             return
         ox, oy = ly.offset
-        L = lb[0] + ox; R = lb[2] + ox; B = lb[1] + oy; Tp = lb[3] + oy
-        X0, Y0 = self._to_canvas(L, Tp)
-        X1, Y1 = self._to_canvas(R, B)
-        if X1 <= X0 or Y1 <= Y0:
+        X0, Y0 = self._to_canvas(bbox[0] + ox, bbox[3] + oy)
+        X1, Y1 = self._to_canvas(bbox[2] + ox, bbox[1] + oy)
+        if X1 - X0 < 0.5 or Y1 - Y0 < 0.5:
             return
-        cx0 = max(0, int(math.ceil(X0))); cy0 = max(0, int(math.ceil(Y0)))
-        cx1 = min(W, int(math.floor(X1))); cy1 = min(H, int(math.floor(Y1)))
-        if cx1 <= cx0 or cy1 <= cy0:
-            return
-        bw, bh = ly.base_img.size
-        fx0 = (cx0 - X0) / (X1 - X0); fx1 = (cx1 - X0) / (X1 - X0)
-        fy0 = (cy0 - Y0) / (Y1 - Y0); fy1 = (cy1 - Y0) / (Y1 - Y0)
-        bx0 = max(0, min(bw - 1, int(fx0 * bw))); bx1 = max(bx0 + 1, min(bw, int(fx1 * bw)))
-        by0 = max(0, min(bh - 1, int(fy0 * bh))); by1 = max(by0 + 1, min(bh, int(fy1 * bh)))
-        mask = ly.base_img.crop((bx0, by0, bx1, by1))
+        cx0 = max(0, int(math.floor(X0))); cy0 = max(0, int(math.floor(Y0)))
+        cx1 = min(W, int(math.ceil(X1)));  cy1 = min(H, int(math.ceil(Y1)))
         dw = cx1 - cx0; dh = cy1 - cy0
-        cw, chh = mask.size
-        if abs(cw - dw) > 1 or abs(chh - dh) > 1:
+        if dw < 1 or dh < 1:
+            return
+        bw, bh = img.size
+        bx0 = max(0, min(bw - 1, int((cx0 - X0) / (X1 - X0) * bw)))
+        bx1 = max(bx0 + 1, min(bw, int((cx1 - X0) / (X1 - X0) * bw)))
+        by0 = max(0, min(bh - 1, int((cy0 - Y0) / (Y1 - Y0) * bh)))
+        by1 = max(by0 + 1, min(bh, int((cy1 - Y0) / (Y1 - Y0) * bh)))
+        mask = img.crop((bx0, by0, bx1, by1))
+        if mask.size != (dw, dh):
             Image = self._PIL()[0]
-            # 只重采样覆盖率 -> 不会出现 RGBA 未预乘导致的黑边/发灰
-            mask = mask.resize((dw, dh),
-                               Image.NEAREST if self._interactive else Image.BILINEAR)
-        solid = ly.solid
-        if solid is None or solid.size != ly.base_img.size:
-            Image = self._PIL()[0]
-            solid = ly.solid = Image.new("RGB", ly.base_img.size, _hex_rgb(ly.color))
-        # 尺寸差 <=1px 时直接 1:1 贴图 (平移流畅的关键: 免每帧重采样)
-        canvas_img.paste(solid.crop((0, 0, dw, dh)), (cx0, cy0), mask)
+            if mask.size[0] < dw or mask.size[1] < dh:
+                # 交互中 BILINEAR 保帧率, 停止后 BICUBIC 更锐
+                mask = mask.resize(
+                    (dw, dh), Image.BILINEAR if self._interactive else Image.BICUBIC)
+            else:
+                mask = mask.resize((dw, dh), Image.BOX)   # 缩小用 BOX, 不产生摩尔纹
+        # 直接按颜色贴图: 源图尺寸再小也不会因为裁切越界而补出黑块
+        rgb = color if isinstance(color, tuple) else _hex_rgb(color or ly.color)
+        canvas_img.paste(rgb, (cx0, cy0, cx1, cy1), mask)
+
+    def _detail_usable(self, ly):
+        """高清块是否与当前视口匹配 (比例一致且覆盖了视口与图层的交集)"""
+        d = ly.detail_img
+        if d is None or not ly.detail_bbox or ly.detail_scale <= 0:
+            return False
+        s = self._sc()[0]
+        if not s or s <= 0:
+            return False
+        if abs(ly.detail_scale - s) / max(s, 1e-9) >= 0.06:
+            return False                       # 缩放变了
+        vw = self._viewport_world(pad=0.0)
+        lb = ly.bbox()                         # 显示坐标 (含偏移)
+        if not vw or not lb:
+            return False
+        ox, oy = ly.offset
+        need = (max(vw[0], lb[0]) - ox, max(vw[1], lb[1]) - oy,
+                min(vw[2], lb[2]) - ox, min(vw[3], lb[3]) - oy)
+        if need[2] <= need[0] or need[3] <= need[1]:
+            return False
+        bb = ly.detail_bbox                    # 平移过 -> 覆盖不到就回落粗缓存
+        return (need[0] >= bb[0] - 1e-6 and need[1] >= bb[1] - 1e-6
+                and need[2] <= bb[2] + 1e-6 and need[3] <= bb[3] + 1e-6)
+
+    def _composite_layer(self, canvas_img, ly, W, H):
+        # 高清块有效时直接用它, 不再叠粗缓存 (被放大的粗图会把清晰边缘糊掉)
+        if self._detail_usable(ly):
+            self._blit(canvas_img, ly, ly.detail_img, ly.detail_bbox, W, H)
+        else:
+            self._blit(canvas_img, ly, ly.base_img, ly.base_bbox or ly.local_bbox(), W, H)
 
     def _draw_placeholder(self, canvas_img, ly):
         b = ly.bbox()
@@ -1502,6 +1967,203 @@ class GerberViewer:
         x0, y0 = self._to_canvas(b[0], b[3])
         x1, y1 = self._to_canvas(b[2], b[1])
         d.rectangle([x0, y0, x1, y1], outline=_hex_rgb(ly.color) + (140,), width=2)
+
+    # ---------------- Solo / 网络高亮 / 测距 ----------------
+    def _layer_on(self, ly):
+        """该图层当前是否参与绘制 (Solo 生效时只显示那一层)"""
+        if self._solo is not None:
+            return ly is self._solo
+        return ly.visible
+
+    def _solo_toggle(self):
+        if self._solo is not None:
+            self._solo = None
+            self.status.set("已退出单层隔离")
+        else:
+            ly = self._sel_layer()
+            if ly is None:
+                self.status.set("先选中一个图层再按 Solo")
+                return
+            self._solo = ly
+            self.status.set(f"单层隔离: {ly.name} (再按一次 Solo 退出)")
+        self._last_img = None
+        self._schedule_render()
+
+    def _net_map(self, ly):
+        """net -> [图元序号]; 只在第一次点选时构建"""
+        if getattr(ly, "net_map", None) is not None:
+            return ly.net_map
+        m = {}
+        store = (ly.data or {}).get("primitives")
+        if store is not None:
+            ex = store.extras
+            for i in range(store.n):
+                e = ex.get(i)
+                if e and e[1]:
+                    m.setdefault(e[1], []).append(i)
+        ly.net_map = m
+        return m
+
+    def _prim_at(self, ly, lx, lyy):
+        """本地坐标命中的图元序号 (取最上面一个)"""
+        store = (ly.data or {}).get("primitives")
+        if store is None or not getattr(store, "n", 0):
+            return None
+        tol = 4.0 / max(self._sc()[0], 1e-6)
+        rec = store.rec
+        extras = store.extras
+        idx = getattr(ly, "index", None)
+        cand = idx.query(lx - tol, lyy - tol, lx + tol, lyy + tol) if idx else None
+        hit = None
+        for i in (range(store.n) if cand is None else cand):
+            b = i * 9
+            if int(rec[b]) == 4:
+                continue
+            bb = _prim_bbox(rec, b, extras, i, {})
+            if bb and bb[0] <= lx <= bb[2] and bb[1] <= lyy <= bb[3]:
+                hit = i                     # 后面的在上层
+        return hit
+
+    def _highlight_at(self, event):
+        """双击: 高亮该点所在图元的整条网络"""
+        x, y = self._canvas_to_mm(event.x, event.y)
+        fallback = None                     # 最上面的命中 (无网络名时兜底)
+        for ly in reversed(self.layers):
+            if not self._layer_on(ly):
+                continue
+            ox, oy = ly.offset
+            lx = x - ox
+            if ly.mirror_x:
+                lx = -lx
+            i = self._prim_at(ly, lx, y - oy)
+            if i is None:
+                continue
+            store = ly.data["primitives"]
+            e = store.extras.get(i)
+            net = (e[1] if e else "") or ""
+            if net:
+                idxs = self._net_map(ly).get(net) or [i]
+                self._hl = {"net": net, "items": [(ly, idxs)]}
+                ref = e[2] if e else ""
+                pin = e[3] if e else ""
+                tip = f"{ref}.{pin} " if (ref and pin) else ""
+                self.status.set(f"网络高亮: {net}  {tip}({len(idxs)} 个图元, Esc 清除)")
+            else:
+                if fallback is None:
+                    fallback = (ly, i)
+                continue                  # 继续往下找带网络名的图元
+            self._last_img = None
+            self._schedule_render()
+            return
+        if fallback is not None:
+            ly, i = fallback
+            self._hl = {"net": "", "items": [(ly, [i])]}
+            self.status.set("该处没有网络名 (X1 文件无 %TO.N), 只高亮这个图元; Esc 清除")
+            self._last_img = None
+            self._schedule_render()
+            return
+        self.status.set("光标下没有图形")
+
+    def _draw_highlight(self, canvas_img, W, H):
+        hl = self._hl
+        if not hl:
+            return
+        s = self._sc()[0]
+        vw = self._viewport_world(pad=0.0)
+        for ly, idxs in hl["items"]:
+            if not self._layer_on(ly) or not idxs:
+                continue
+            lb = ly.local_bbox()
+            if not lb or not vw:
+                continue
+            ox, oy = ly.offset
+            x0 = max(vw[0] - ox, lb[0]); x1 = min(vw[2] - ox, lb[2])
+            y0 = max(vw[1] - oy, lb[1]); y1 = min(vw[3] - oy, lb[3])
+            if x1 - x0 <= 1e-9 or y1 - y0 <= 1e-9:
+                continue
+            try:
+                mask, _sc = self._render_layer_bitmap(
+                    ly.data, ly.kind, [x0, y0, x1, y1], ly.mirror_x, ly.color, s,
+                    clamp=False, indices=idxs)
+            except Exception:            # noqa: BLE001
+                continue
+            self._blit(canvas_img, ly, mask, [x0, y0, x1, y1], W, H, color=HL_RGB)
+
+    def _clear_overlays(self, _e=None):
+        self._hl = None
+        self._measure_on = False
+        if getattr(self, "_measure_var", None) is not None:
+            self._measure_var.set(False)
+        self._measure_pts = []
+        self._measure_cur = None
+        self._last_img = None
+        self._refresh_measure()
+        self._schedule_render()
+        self.status.set("已清除高亮/测距")
+
+    # ---------------- 测距 / 测角度 (画在 Tk 画布上, 不重绘位图) ----------------
+    def _measure_toggle(self):
+        self._measure_on = not self._measure_on
+        self._measure_var.set(self._measure_on)
+        self._measure_pts = []
+        self._measure_cur = None
+        self._refresh_measure()
+        if self._measure_on:
+            self.status.set("测距: 左键点第 1 点, 第 2 点得到距离/角度, 第 3 点测夹角; Esc 退出")
+        else:
+            self.status.set("测距已关闭")
+
+    def _measure_click(self, event):
+        if len(self._measure_pts) >= 3:
+            self._measure_pts = []
+        self._measure_pts.append(self._canvas_to_mm(event.x, event.y))
+        self._measure_cur = None
+        self._refresh_measure()
+
+    def _refresh_measure(self):
+        """用 Tk 画布对象画测距线和读数 (避免每次鼠标移动都重绘整幅位图)"""
+        cv = getattr(self, "canvas", None)
+        if cv is None or not hasattr(cv, "delete"):
+            return
+        try:
+            cv.delete("measure")
+            if not self._measure_on and not self._measure_pts:
+                return
+            pts = [self._to_canvas(x, y) for x, y in self._measure_pts]
+            if self._measure_on and self._measure_cur and pts:
+                pts.append(self._to_canvas(*self._measure_cur))
+            for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+                cv.create_line(ax, ay, bx, by, fill="#00e5ff", width=2, tags="measure")
+            for (ax, ay) in pts:
+                cv.create_oval(ax - 3, ay - 3, ax + 3, ay + 3,
+                               outline="#00e5ff", width=2, tags="measure")
+            txt = self._measure_text()
+            if txt:
+                ax, ay = pts[-1]
+                cv.create_text(ax + 12, ay + 12, text=txt, anchor="nw", tags="measure",
+                               fill="#00e5ff", font=("Consolas", 10, "bold"))
+        except Exception:                # noqa: BLE001
+            pass
+
+    def _measure_text(self):
+        p = self._measure_pts
+        if len(p) < 2:
+            return ""
+        (x1, y1), (x2, y2) = p[0], p[1]
+        dx, dy = x2 - x1, y2 - y1
+        dist = math.hypot(dx, dy)
+        ang = math.degrees(math.atan2(dy, dx))
+        s = f"{dist:.3f} mm   dx={dx:+.3f}  dy={dy:+.3f}   {ang:.2f}deg"
+        if len(p) >= 3:
+            (x3, y3) = p[2]
+            v1 = (x1 - x2, y1 - y2)
+            v2 = (x3 - x2, y3 - y2)
+            n1 = math.hypot(*v1)
+            n2 = math.hypot(*v2)
+            if n1 > 1e-9 and n2 > 1e-9:
+                cosv = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
+                s += f"\n夹角={math.degrees(math.acos(cosv)):.2f}deg"
+        return s
 
     def _draw_sel_rect(self, d, ly):
         b = ly.bbox()

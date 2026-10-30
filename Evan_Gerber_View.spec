@@ -4,7 +4,11 @@
 a = Analysis(
     ['Evan_Gerber_View.py'],
     pathex=[],
-    binaries=[],
+    binaries=[
+        # Rust 原生解析内核 (可选, 缺失时自动回退纯 Python)
+        # 必须是 .pyd 后缀, 否则 importlib 不会把它当扩展模块
+        ('rust/gerber_core/gerber_core.pyd', '.'),
+    ],
     datas=[
         ('Evan_Gerber_View.ico', '.'),
         ('Evan_Gerber_View.png', '.'),
@@ -15,6 +19,7 @@ a = Analysis(
         'PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageTk', 'PIL.ImageFont',
         'PIL.ImageFilter',
         'gerber_viewer', 'gerber_reader', 'gerber_layer', 'win_dpi', 'branding',
+        'gerber_native',
     ],
     hookspath=[],
     hooksconfig={},
