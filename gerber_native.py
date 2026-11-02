@@ -2,8 +2,9 @@
 """Rust 原生解析后端 (gerber_core.pyd) 的 Python 胶水
 
 设计原则: **要么逐字节等价, 要么完全不用**。
-Rust 只处理它能确定性复刻的子集 (标准坐标命令/简单光圈/显式单位),
-遇到 %AM / %SR / 区域 / 圆弧 / X2 属性 / 未声明单位 就返回 None,
+Rust 只处理它能确定性复刻的子集
+(标准坐标命令/简单光圈/区域/多象限圆弧/X2 属性/显式单位),
+遇到 %AM / %SR / G74 / 带小数坐标 / 未声明单位 就返回 None,
 这里也返回 None, 上层 parse_gerber 自动回退到纯 Python 实现。
 """
 import os
@@ -107,6 +108,21 @@ def _build(path, layer_name, r):
             res.apertures[got[0]] = got[1]
     for code, cnt in r["ap_use"]:
         res.ap_usage[code] = cnt
+    # X2 网络/元件属性 (extras 与区域顶点合并到同一条目)
+    for item in r.get("extras") or []:
+        idx, net, ref, pin = item
+        idx = int(idx)
+        old = st.extras.get(idx)
+        pts = old[0] if old else None
+        st.extras[idx] = (pts, net, ref, pin)
+    res.nets = {k: set(v) for k, v in (r.get("nets") or [])}
+    res.file_function = r.get("file_function") or ""
+    res.file_part = r.get("file_part") or ""
+    res.file_polarity = r.get("file_polarity") or ""
+    res.software = r.get("software") or ""
+    res.creation_date = r.get("creation_date") or ""
+    res.aperture_function = r.get("aperture_function") or ""
+    res.attributes_present = bool(r.get("attributes_present"))
 
     unit = r["unit"]
     unit_src = r["unit_src"]
@@ -134,6 +150,8 @@ def _build(path, layer_name, r):
                         ("B" if mirror[1] else ""))
     if rot:
         warnings.append("含图像旋转 %%IR%d" % rot)
+    if res.file_polarity.upper().startswith("NEG"):
+        warnings.append("文件为负极性(FilePolarity=Negative)")
     # 与纯 Python 路径末尾的图幅合理性检查保持一致
     b = res.bbox
     if b and b[0] is not None:
@@ -157,6 +175,7 @@ def _build(path, layer_name, r):
         "software": res.software,
         "creation_date": res.creation_date,
         "file_polarity": res.file_polarity,
+        "attributes_present": res.attributes_present,
         "image_scale": scale,
         "image_offset": off,
         "image_mirror": mirror,
@@ -167,8 +186,7 @@ def _build(path, layer_name, r):
         "primitives": res.primitives,
         "bbox": res.bbox,
         "feature_count": res.feature_count,
-        "attributes_present": False,
-        "nets": {},
+        "nets": {k: sorted(v) for k, v in res.nets.items()},
         "min_line_width_mm": round(res.min_width, 4) if res.min_width else None,
         "min_pad_mm": G._min_pad(res),
         "aperture_count": len(res.apertures),

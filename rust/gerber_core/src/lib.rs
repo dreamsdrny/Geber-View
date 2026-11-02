@@ -1,12 +1,16 @@
 //! Gerber 解析热路径 —— Rust 原生扩展
 //!
 //! 只覆盖"能确定性复刻 Python 语义"的子集; 一旦遇到不支持的结构
-//! (光圈宏 %AM / 拼版 %SR / 区域 G36-G37 / 单象限弧 G74 / 圆弧 G02-G03 /
-//!  X2 属性 %TF-%TA-%TO-%TD / 未声明单位) 就返回 None,
-//! Python 端整体回退到原解析器 —— 正确性由"要么逐字节相同, 要么不用"保证。
+//! (光圈宏 %AM / 拼版 %SR / 单象限弧 G74 / 带小数坐标 / 未声明单位)
+//! 就返回 None, Python 端整体回退到原解析器。
+//!
+//! 已支持: 标准坐标命令 / 区域 G36-G37 / 多象限圆弧 G02-G03 /
+//! X2 属性 %TF-%TA-%TO-%TD (含网络名与 refdes/pin)。
+//! 正确性由"要么逐字节相同, 要么不用"保证。
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
+use std::collections::{BTreeMap, BTreeSet};
 
 const PRIM_DRAW: f64 = 0.0;
 const PRIM_FLASH: f64 = 1.0;
@@ -70,6 +74,20 @@ struct P<'a> {
     aps: Vec<Ap>,
     ap_use: Vec<(i32, u64)>,
     warnings: Vec<&'static str>,
+    // ---- X2 属性 (%TF/%TA/%TO/%TD) ----
+    cur_net: String,
+    cur_ref: String,
+    cur_pin: String,
+    file_function: String,
+    file_part: String,
+    file_polarity: String,
+    software: String,
+    creation_date: String,
+    aperture_function: String,
+    attributes_present: bool,
+    // 图元序号 -> (net, refdes, pin); 区域顶点仍由 regions_out 单独返回
+    extras: Vec<(usize, String, String, String)>,
+    nets: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn is_ws(b: u8) -> bool {
@@ -154,6 +172,23 @@ fn scan_nums(s: &[u8]) -> Vec<f64> {
     out
 }
 
+/// 按逗号拆分并去掉每段两端空白 (等价 Python 的 `[p.strip() for p in s.split(",")]`)
+fn split_parts(s: &[u8]) -> Vec<&[u8]> {
+    s.split(|&c| c == b',').map(trim).collect()
+}
+
+/// 把若干片段用逗号重新拼接 (等价 Python 的 `",".join(parts[1:])`)
+fn join_parts(parts: &[&[u8]]) -> String {
+    let mut out = Vec::new();
+    for (k, p) in parts.iter().enumerate() {
+        if k > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(p);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 impl<'a> P<'a> {
     fn new(data: &'a [u8]) -> Self {
         P {
@@ -190,6 +225,18 @@ impl<'a> P<'a> {
             aps: Vec::new(),
             ap_use: Vec::new(),
             warnings: Vec::new(),
+            cur_net: String::new(),
+            cur_ref: String::new(),
+            cur_pin: String::new(),
+            file_function: String::new(),
+            file_part: String::new(),
+            file_polarity: String::new(),
+            software: String::new(),
+            creation_date: String::new(),
+            aperture_function: String::new(),
+            attributes_present: false,
+            extras: Vec::new(),
+            nets: BTreeMap::new(),
         }
     }
 
@@ -313,10 +360,25 @@ impl<'a> P<'a> {
         i: f64,
         j: f64,
     ) {
+        let idx = self.n;
         self.rec
             .extend_from_slice(&[code, x1, y1, x2, y2, w, ap, i, j]);
         self.n += 1;
         self.feat += 1;
+        if !(self.cur_net.is_empty() && self.cur_ref.is_empty() && self.cur_pin.is_empty()) {
+            self.extras.push((
+                idx,
+                self.cur_net.clone(),
+                self.cur_ref.clone(),
+                self.cur_pin.clone(),
+            ));
+            if !self.cur_net.is_empty() && !self.cur_ref.is_empty() && !self.cur_pin.is_empty() {
+                self.nets
+                    .entry(self.cur_net.clone())
+                    .or_default()
+                    .insert(format!("{}.{}", self.cur_ref, self.cur_pin));
+            }
+        }
     }
 
     // ---------- 扩展命令块 ----------
@@ -346,15 +408,69 @@ impl<'a> P<'a> {
     fn ext_one(&mut self, s: &[u8]) -> bool {
         let u = up(s);
         // ---- 不支持 -> 整体回退 ----
-        if u.starts_with(b"AM")
-            || u.starts_with(b"SR")
-            || u.starts_with(b"AS")
-            || u.starts_with(b"TF")
-            || u.starts_with(b"TA")
-            || u.starts_with(b"TO")
-            || u.starts_with(b"TD")
-        {
+        if u.starts_with(b"AM") || u.starts_with(b"SR") || u.starts_with(b"AS") {
             return false;
+        }
+        // ---- X2 属性: 只影响元数据/网络名, 不改变几何, 原生可安全接管 ----
+        if u.starts_with(b"TF") {
+            let parts = split_parts(s);
+            let head = parts.first().copied().unwrap_or(&[]);
+            let hup = up(head);
+            let key: &[u8] = if hup.starts_with(b"TF.") {
+                &head[3..]
+            } else {
+                &head[2..]
+            };
+            let val = join_parts(parts.get(1..).unwrap_or(&[]));
+            match key {
+                b"FileFunction" => self.file_function = val,
+                b"FilePolarity" => self.file_polarity = val,
+                b"Part" => self.file_part = val,
+                b"GenerationSoftware" => self.software = val,
+                b"CreationDate" => self.creation_date = val,
+                _ => {}
+            }
+            self.attributes_present = true;
+            return true;
+        }
+        if u.starts_with(b"TA") {
+            let parts = split_parts(s);
+            let hup = up(parts.first().copied().unwrap_or(&[]));
+            if hup == b"TA.APERFUNCTION" {
+                self.aperture_function = join_parts(parts.get(1..).unwrap_or(&[]));
+            }
+            return true;
+        }
+        if u.starts_with(b"TO") {
+            let parts = split_parts(s);
+            let hup = up(parts.first().copied().unwrap_or(&[]));
+            if hup == b"TO.N" {
+                self.cur_net = join_parts(parts.get(1..).unwrap_or(&[]));
+                self.cur_ref.clear();
+                self.cur_pin.clear();
+            } else if hup == b"TO.P" {
+                self.cur_ref = parts
+                    .get(1)
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .unwrap_or_default();
+                self.cur_pin = parts
+                    .get(2)
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .unwrap_or_default();
+            } else if hup == b"TO.C" {
+                self.cur_ref = parts
+                    .get(1)
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .unwrap_or_default();
+            }
+            self.attributes_present = true;
+            return true;
+        }
+        if u.starts_with(b"TD") {
+            self.cur_net.clear();
+            self.cur_ref.clear();
+            self.cur_pin.clear();
+            return true;
         }
         if u.starts_with(b"FS") {
             let mut k = 2;
@@ -925,6 +1041,23 @@ fn parse(py: Python<'_>, data: &[u8]) -> PyResult<Option<PyObject>> {
         regs.append((*idx, pts.clone()))?;
     }
     out.set_item("regions", regs)?;
+    let extras = PyList::empty_bound(py);
+    for (idx, net, rf, pin) in &p.extras {
+        extras.append((*idx, net.clone(), rf.clone(), pin.clone()))?;
+    }
+    out.set_item("extras", extras)?;
+    let nets = PyList::empty_bound(py);
+    for (net, pins) in &p.nets {
+        nets.append((net.clone(), pins.iter().cloned().collect::<Vec<_>>()))?;
+    }
+    out.set_item("nets", nets)?;
+    out.set_item("file_function", p.file_function.clone())?;
+    out.set_item("file_part", p.file_part.clone())?;
+    out.set_item("file_polarity", p.file_polarity.clone())?;
+    out.set_item("software", p.software.clone())?;
+    out.set_item("creation_date", p.creation_date.clone())?;
+    out.set_item("aperture_function", p.aperture_function.clone())?;
+    out.set_item("attributes_present", p.attributes_present)?;
     Ok(Some(out.into()))
 }
 

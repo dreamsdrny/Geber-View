@@ -27,8 +27,15 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from gerber_reader import parse_gerber, parse_excellon
+from gerber_reader import detect_file_kind, parse_gerber, parse_excellon
 from branding import win_title
+
+# 文件对话框后缀: 覆盖常见 CAM/制程量测导出格式 (无需再选 "All files")
+_GERBER_PATTERNS = (
+    "*.gbr *.ger *.art *.pho *.gdo *.gbx *.gbz *.gko *.gml "
+    "*.g? *.g?? *.gp? *.gp?? *.gm? *.gm?? "
+    "*.gtl *.gbl *.gto *.gbo *.gts *.gbs *.gtp *.gbp")
+_DRILL_PATTERNS = "*.drl *.drill *.nc *.ncd *.xln *.exc *.tap *.txt"
 
 def _outside(pts, clip, margin=0):
     """折线/多边形是否完全落在裁剪矩形之外"""
@@ -611,8 +618,15 @@ class GerberViewer:
                 base = os.path.basename(p)
                 self._ui_q.put(("status", f"解析中: {base}"))
                 try:
-                    low = p.lower()
-                    if low.endswith(".drl") or "drill" in low:
+                    # 先按内容/后缀判定 (制程量测 Gerber 可能是 .txt 或无后缀)
+                    kind = detect_file_kind(p)
+                    if kind is None:
+                        low = p.lower()
+                        kind = "drill" if (low.endswith((".drl", ".drill", ".nc",
+                                                          ".ncd", ".xln", ".exc",
+                                                          ".tap", ".txt"))
+                                           or "drill" in low) else "gerber"
+                    if kind == "drill":
                         data = parse_excellon(p)
                     else:
                         data = parse_gerber(p, layer_name=base)
@@ -815,36 +829,47 @@ class GerberViewer:
 
     def _import_gerber(self):
         paths = filedialog.askopenfilenames(
-            title="导入 Gerber 文件 (可多选)",
-            filetypes=[("Gerber", "*.gbr *.ger *.art *.pho *.gto *.gbo *.gts *.gbs *.gtl *.gbl"),
+            title="导入 Gerber 文件 (可多选, 已含制程量测常用格式)",
+            filetypes=[("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
+                       ("Gerber", _GERBER_PATTERNS),
+                       ("钻孔 NC Drill", _DRILL_PATTERNS),
                        ("All files", "*.*")])
         self._enqueue_parse(paths)
 
     def _import_drill(self):
-        paths = filedialog.askopenfilenames(title="导入钻孔 (NC Drill, 可多选)",
-                                            filetypes=[("Drill", "*.drl *.txt"), ("All files", "*.*")])
+        paths = filedialog.askopenfilenames(
+            title="导入钻孔 (NC Drill, 可多选)",
+            filetypes=[("钻孔 NC Drill", _DRILL_PATTERNS),
+                       ("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
+                       ("All files", "*.*")])
         self._enqueue_parse(paths)
 
     def _import_dir(self):
-        d = filedialog.askdirectory(title="导入目录下全部 Gerber/钻孔")
+        d = filedialog.askdirectory(title="导入目录下全部 Gerber/钻孔 (按内容自动识别)")
         if not d:
             return
         self._enqueue_parse(self._gather_dir(d))
 
     def _gather_dir(self, d):
-        exts = (".gbr", ".ger", ".art", ".pho", ".gto", ".gbo", ".gts", ".gbs",
-                ".gtl", ".gbl", ".gtp", ".gbp", ".gko", ".gm1", ".drl")
+        """收集目录下全部 Gerber/钻孔 (识别后缀+文件头, 无后缀也能找到)"""
         paths = []
         for root_, _dirs, files in os.walk(d):
             for fn in sorted(files):
-                if fn.lower().endswith(exts):
-                    paths.append(os.path.join(root_, fn))
+                p = os.path.join(root_, fn)
+                try:
+                    if detect_file_kind(p) is None:
+                        continue
+                except OSError:
+                    continue
+                paths.append(p)
         return paths
 
     def _compare_load(self, group):
         paths = filedialog.askopenfilenames(
             title=f"对比 {group}: 选择多层 Gerber/钻孔 (可多选; 取消则改为选目录)",
-            filetypes=[("Gerber/Drill", "*.gbr *.ger *.art *.pho *.drl *.gto *.gbo *.gts *.gbs *.gtl *.gbl"),
+            filetypes=[("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
+                       ("Gerber", _GERBER_PATTERNS),
+                       ("钻孔 NC Drill", _DRILL_PATTERNS),
                        ("All files", "*.*")])
         if not paths:
             d = filedialog.askdirectory(title=f"对比 {group}: 选择包含多层的目录")
@@ -1562,11 +1587,15 @@ class GerberViewer:
         if ly.pending:
             return
         if ly.base_img is not None and ly.base_scale > 0:
-            # 已经到上限: 放大时靠 detail 块补清晰度, 不再每次缩放都重光栅化整层
+            # 已经有缓存: 放大靠 detail 块补清晰度, 缩小直接重采样旧图即可。
+            # 大图层每次缩放都重光栅化整层会卡顿, 这里只给图元较少的层重新渲染。
             if ly.base_scale >= hard_cap * 0.98:
                 return
             if abs(ly.base_scale - target) / max(target, 1e-6) < 0.55:
                 return
+            store = (ly.data or {}).get("primitives")
+            if getattr(store, "n", 0) >= 20000:
+                return                      # 大图层交给 _request_detail 的局部高清块
         ly.token += 1
         ly.pending = True
         self._render_q.put(("base", ly.token, ly.data, ly.kind, list(lb),

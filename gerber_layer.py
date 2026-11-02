@@ -74,9 +74,17 @@ NAME_RULES: list[LayerRule] = [
             r"plated",
             r"drill",
             r"\.drl$",
-            r"\.txt$",
+            r"\.drill$",
+            r"\.nc$",
             r"\.ncd$",
+            r"\.xln$",
+            r"\.exc$",
+            r"\.tap$",
+            r"\.txt$",
             r"\.drl\.",
+            r"钻孔",
+            r"通孔",
+            r"孔位",
         ],
         kind=KIND_DRILL,
         priority=100,
@@ -93,6 +101,11 @@ NAME_RULES: list[LayerRule] = [
             r"rout",
             r"\.gko$",
             r"\.gm[1-9]\d*$",
+            r"外形",
+            r"轮廓",
+            r"成型",
+            r"板框",
+            r"铣边",
         ],
         kind=KIND_PROFILE,
         priority=90,
@@ -107,6 +120,8 @@ NAME_RULES: list[LayerRule] = [
             r"top[_\-]?mask",
             r"\.gts$",
             r"\-f\.mask",
+            r"(?:top|顶|正面|元件面).*(?:阻焊|防焊|绿油)",
+            r"(?:阻焊|防焊|绿油).*(?:top|顶|正面|元件面)",
         ],
         kind=KIND_MASK,
         side=SIDE_TOP,
@@ -122,10 +137,19 @@ NAME_RULES: list[LayerRule] = [
             r"bottom[_\-]?mask",
             r"\.gbs$",
             r"\-b\.mask",
+            r"(?:bot|bottom|底|背面|焊接面).*(?:阻焊|防焊|绿油)",
+            r"(?:阻焊|防焊|绿油).*(?:bot|bottom|底|背面|焊接面)",
         ],
         kind=KIND_MASK,
         side=SIDE_BOTTOM,
         priority=80,
+    ),
+
+    # 阻焊：中文命名未标注面 -> 只判类型, 不猜面
+    LayerRule(
+        patterns=[r"阻焊", r"防焊", r"绿油", r"solder[_\-]?mask"],
+        kind=KIND_MASK,
+        priority=78,
     ),
 
     # 丝印：顶层
@@ -139,6 +163,8 @@ NAME_RULES: list[LayerRule] = [
             r"\.gto$",
             r"\-f\.silks",
             r"\.plc$",
+            r"(?:top|顶|正面|元件面).*(?:丝印|文字|字符)",
+            r"(?:丝印|文字|字符).*(?:top|顶|正面|元件面)",
         ],
         kind=KIND_SILK,
         side=SIDE_TOP,
@@ -155,10 +181,19 @@ NAME_RULES: list[LayerRule] = [
             r"\.gbo$",
             r"\-b\.silks",
             r"\.pls$",
+            r"(?:bot|bottom|底|背面).*(?:丝印|文字|字符)",
+            r"(?:丝印|文字|字符).*(?:bot|bottom|底|背面)",
         ],
         kind=KIND_SILK,
         side=SIDE_BOTTOM,
         priority=70,
+    ),
+
+    # 丝印：中文命名未标注面 -> 只判类型
+    LayerRule(
+        patterns=[r"丝印", r"文字", r"字符", r"silkscreen", r"legend"],
+        kind=KIND_SILK,
+        priority=68,
     ),
 
     # 钢网：顶层
@@ -191,6 +226,13 @@ NAME_RULES: list[LayerRule] = [
         priority=60,
     ),
 
+    # 钢网/锡膏：中文命名
+    LayerRule(
+        patterns=[r"钢网", r"锡膏", r"paste", r"stencil"],
+        kind=KIND_PASTE,
+        priority=58,
+    ),
+
     # 铜层：顶层
     LayerRule(
         patterns=[
@@ -204,6 +246,8 @@ NAME_RULES: list[LayerRule] = [
             r"\.cmp$",
             r"art[_\-]?top",
             r"\.art$",
+            r"(?:top|顶|正面|元件面).*(?:线路|铜箔|铜层)",
+            r"(?:线路|铜箔|铜层).*(?:top|顶|正面|元件面)",
         ],
         kind=KIND_COPPER,
         side=SIDE_TOP,
@@ -224,6 +268,8 @@ NAME_RULES: list[LayerRule] = [
             r"signal[_\-]?bottom",
             r"solder",
             r"\.sol$",
+            r"(?:bot|bottom|底|背面).*(?:线路|铜箔|铜层)",
+            r"(?:线路|铜箔|铜层).*(?:bot|bottom|底|背面)",
         ],
         kind=KIND_COPPER,
         side=SIDE_BOTTOM,
@@ -240,10 +286,21 @@ NAME_RULES: list[LayerRule] = [
             r"\-in\d+\.cu",
             r"signal[_\-]?inner",
             r"inner[_\-]?\d+",
+            r"内层",
+            r"中间层",
+            r"内电层",
         ],
         kind=KIND_COPPER,
         side=SIDE_INNER,
         priority=40,
+    ),
+
+    # 铜层：中文命名未标注面/层号 -> 只判类型
+    LayerRule(
+        patterns=[r"线路", r"铜箔", r"铜层", r"copper", r"signal"],
+        kind=KIND_COPPER,
+        side=SIDE_UNKNOWN,
+        priority=39,
     ),
 
     # 兜底：纯数字后缀 .g1 / .g2 等，优先级最低

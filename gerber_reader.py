@@ -17,6 +17,8 @@ import logging
 import math
 import os
 import re
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
@@ -211,6 +213,82 @@ class GerberResult:
 
 
 _NUM = r"[-+]?\d*\.?\d+"
+
+# ============================================================
+# 文件类型识别 (供文件对话框/目录导入使用)
+# ============================================================
+# 常见制造数据后缀: 除 PCB 软件标准后缀外, 还覆盖制程量测/CAM 导出的
+# .g1..g99 / .gp1 / .gm2 / .nc / .ncd / .xln / .gdo / .gbx 等。
+_GERBER_EXT_RE = re.compile(
+    r"\.(?:gbr|ger|art|pho|gdo|gbx|gbz|gko|gml|"
+    r"g[1-9]\d*|gp[1-9]\d*|gm[1-9]\d*|"
+    r"gt[lobsp]|gb[lobsp]|gts|gbs|gto|gbo|gtp|gbp)$", re.IGNORECASE)
+_DRILL_EXT_RE = re.compile(
+    r"\.(?:drl|drill|nc|ncd|xln|exc|tap|txt)$", re.IGNORECASE)
+
+_GERBER_HINT_RE = re.compile(
+    r"%FS|%MO|%ADD|%TF\.|%AM|%SR|G0?36|G0?75|M02\*|D0?[123]\*", re.IGNORECASE)
+_DRILL_HINT_RE = re.compile(
+    r"(?:^|[\r\n])M48\b|(?:^|[\r\n])(?:METRIC|INCH)\b|"
+    r"(?:^|[\r\n])T\d+\s*C[-+]?\d", re.IGNORECASE)
+
+
+def _sniff_text(path: str, limit: int = 8192) -> str:
+    """读取文件头部一小段文本用于类型嗅探 (二进制文件返回空串)"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(limit)
+    except OSError:
+        return ""
+    if b"\x00" in raw[:1024]:
+        return ""
+    return raw.decode("latin-1", "ignore")
+
+
+def _looks_like_gerber(text: str) -> bool:
+    if not text:
+        return False
+    if _GERBER_HINT_RE.search(text):
+        return True
+    # 无标准扩展名时, 用 "X..Y..D01/02/03" 坐标命令兜底
+    return bool(re.search(r"[XY][-+]?\d+.*D0?[123]\s*\*", text, re.IGNORECASE))
+
+
+def _looks_like_drill(text: str) -> bool:
+    if not text:
+        return False
+    if _DRILL_HINT_RE.search(text):
+        return True
+    return bool(re.search(r"(?:^|[\r\n])T\d+\s*$", text, re.IGNORECASE)
+                and re.search(r"(?:^|[\r\n])[XY][-+]?\d", text, re.IGNORECASE))
+
+
+def detect_file_kind(path: str) -> Optional[str]:
+    """判断文件是 "gerber" / "drill"; 无法识别返回 None
+
+    先看后缀 (零 I/O); 后缀不明确 (含 .txt / 无后缀) 时再嗅探文件头。
+    制程量测导出的 Gerber 常使用 .txt 或无后缀, 这样也能正确识别。
+    """
+    name = os.path.basename(path)
+    if _GERBER_EXT_RE.search(name):
+        return "gerber"
+    is_txt = name.lower().endswith(".txt")
+    if _DRILL_EXT_RE.search(name) and not is_txt:
+        return "drill"
+    text = _sniff_text(path)
+    if _looks_like_gerber(text):
+        return "gerber"
+    if _looks_like_drill(text):
+        return "drill"
+    # .txt 内容不明确时不参与目录批量导入 (避免把普通文本当 Gerber)
+    if _DRILL_EXT_RE.search(name) and not is_txt:
+        return "drill"
+    return None
+
+
+def is_fab_file(path: str) -> bool:
+    """是否为可导入的 Gerber / NC Drill 文件"""
+    return detect_file_kind(path) is not None
 
 
 def _parse_aperture(block: str) -> Optional[Tuple[int, dict]]:
@@ -739,6 +817,58 @@ def _infer_gerber_unit(ap_vals: List[float], span_raw: float) -> str:
     return "mm"
 
 
+# ============================================================
+# 解析结果缓存: 同一文件重复打开 / 对比导入时直接复用 (秒开)
+# ============================================================
+_PARSE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_PARSE_CACHE_LOCK = threading.Lock()
+_PARSE_CACHE_MAX_FILES = 8
+_PARSE_CACHE_MAX_PRIMS = 2_000_000      # 约 144MB 记录内存, 超出按 LRU 淘汰
+
+
+def _cache_key(path: str, layer_name: Optional[str]) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.abspath(path), st.st_mtime_ns, st.st_size,
+            layer_name or "")
+
+
+def _cache_get(key: Optional[tuple]) -> Optional[dict]:
+    if key is None:
+        return None
+    with _PARSE_CACHE_LOCK:
+        hit = _PARSE_CACHE.get(key)
+        if hit is None:
+            return None
+        _PARSE_CACHE.move_to_end(key)
+    # 浅拷贝: 调用方可能写入 _role 等元数据, 不污染缓存本体
+    return dict(hit)
+
+
+def _cache_put(key: Optional[tuple], data: dict) -> None:
+    if key is None or not data:
+        return
+    n = getattr(data.get("primitives"), "n", 0) or 0
+    if n > _PARSE_CACHE_MAX_PRIMS:
+        return
+    with _PARSE_CACHE_LOCK:
+        _PARSE_CACHE[key] = data
+        _PARSE_CACHE.move_to_end(key)
+        total = sum(getattr(v.get("primitives"), "n", 0) or 0
+                    for v in _PARSE_CACHE.values())
+        while (_PARSE_CACHE and (len(_PARSE_CACHE) > _PARSE_CACHE_MAX_FILES
+                                 or total > _PARSE_CACHE_MAX_PRIMS)):
+            _old_key, _old = _PARSE_CACHE.popitem(last=False)
+            total -= getattr(_old.get("primitives"), "n", 0) or 0
+
+
+def clear_parse_cache() -> None:
+    with _PARSE_CACHE_LOCK:
+        _PARSE_CACHE.clear()
+
+
 def parse_gerber(path: str, layer_name: Optional[str] = None,
                  unit_override: Optional[str] = None,
                  scale_override: Optional[float] = None) -> dict:
@@ -755,12 +885,21 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
       - 圆弧: G75 多象限 / G74 单象限 (I/J 绝对值需按走向定圆心符号)
       - 极性: %LPD/%LPC、X2 属性 %TF/%TA/%TO/%TD
     """
+    # ---- 解析结果缓存 (同一文件重复查看时直接复用) ----
+    key = None
+    if unit_override is None and scale_override is None:
+        key = _cache_key(path, layer_name)
+        cached = _cache_get(key)
+        if cached is not None:
+            return cached
+
     # ---- 优先走 Rust 原生后端 (不支持时自动回退到下面的纯 Python 实现) ----
     if unit_override is None and scale_override is None:
         _nb = _native_backend()
         if _nb is not None:
             _native_data = _nb.parse(path, layer_name)
             if _native_data is not None:
+                _cache_put(key, _native_data)
                 return _native_data
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1462,6 +1601,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         elif max(w, h) < 1:
             data.setdefault("warnings", []).append(
                 f"图幅仅 {w:.2f}×{h:.2f}mm 异常偏小, 请确认坐标格式与单位声明")
+    _cache_put(key, data)
     return data
 
 
@@ -1564,6 +1704,14 @@ def parse_excellon(path: str, plating: Optional[str] = None,
       - 槽孔: G85 / M15+G01 路由; 重复: R##; 模态坐标: 省略 X 或 Y 时沿用上一值
       - 孔性质: PLATED / NON_PLATED (按刀具), 或文件名 PTH/NPTH
     """
+    key = None
+    if unit_override is None and format_override is None and scale_override is None:
+        base_key = _cache_key(path, None)
+        if base_key is not None:
+            key = base_key + ("drill", plating or "")
+            cached = _cache_get(key)
+            if cached is not None:
+                return cached
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.read().splitlines()
 
@@ -1899,7 +2047,7 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         warnings.append(f"已应用人工比例校正 ×{scale_override:g}")
 
     diameters = [h["diameter_mm"] for h in holes if h.get("diameter_mm")]
-    return {
+    data = {
         "kind": "drill",
         "file": path,
         "name": os.path.basename(path),
@@ -1918,3 +2066,5 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         "bbox": bbox,
         "warnings": warnings,
     }
+    _cache_put(key, data)
+    return data
