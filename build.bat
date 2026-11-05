@@ -19,7 +19,8 @@ if %errorlevel% neq 0 (
 :: 判断当前目录下是否不存在 Evan_Gerber_View.ico 图标文件
 if not exist "Evan_Gerber_View.ico" (
     echo Generating icon...
-    python make_icon.py  :: 运行python脚本，自动生成图标
+    :: 运行 python 脚本，自动生成图标
+    python make_icon.py
 )
 
 echo Cleaning old build...

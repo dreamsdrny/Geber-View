@@ -13,7 +13,7 @@
 
 ## 功能特性
 
-- **多格式导入**：Gerber RS-274X / Gerber X2、Excellon NC Drill（`.gbr/.ger/.art/.g1..g99/.gp1/.gm2/.gto/.gbo/.gts/.gbs/.gtl/.gbl/.gko/.drl/.nc/.ncd/.xln/.txt` 等），支持整目录批量导入；制程量测导出的 `.txt`/无后缀文件按内容自动识别，无需先选“全部文件”。
+- **多格式导入**：Gerber RS-274X / Gerber X2、Excellon NC Drill（`.gbr/.ger/.art/.g1..g99/.gp1/.gm2/.gto/.gbo/.gts/.gbs/.gtl/.gbl/.gko/.drl/.nc/.ncd/.xln/.txt` 等），支持整目录批量导入；制程量测导出的 `.txt`/无后缀文件按内容自动识别，无需先选“全部文件”。选一个文件即可自动带入同目录全部 Gerber（可取消勾选“自动带入同目录”）；批量层数较多时默认隐藏内层铜/钢网/盲埋孔，避免画面过乱。
 - **图层自动着色**：按层类型（铜/阻焊/丝印/锡膏/外形/钻孔、顶/底/内层）自动分配颜色，属性面板可查看单位、格式、图幅、图元/孔数。
 - **图层管理**：开/关、全开/全关、反选、上移/下移、删除；**双击图层名即可修改该层颜色**（KiCad 风格取色器）。
 - **视图操作**：滚轮缩放、右键拖动平移、适应窗口、居中/镜像/偏移；选中层可单独拖动对齐。
@@ -35,11 +35,16 @@ python Evan_Gerber_View.py
 # 方式一：一键脚本
 build.bat
 
-# 方式二：手动
+# 方式二：手动（目录版，带 _internal）
 python -m PyInstaller --clean --noconfirm Evan_Gerber_View.spec
+
+# 方式三：单文件版（全部依赖打进 exe，不再需要 _internal）
+python -m PyInstaller --clean --noconfirm Evan_Gerber_View_onefile.spec
 ```
 
-产物：`dist/Evan_Gerber_View/Evan_Gerber_View.exe`
+产物：
+- 目录版：`dist/Evan_Gerber_View/Evan_Gerber_View.exe`
+- 单文件版：`dist/Evan_Gerber_View.exe`（约 17MB，首次启动会解压到临时目录，略慢 1~2 秒）
 
 > 若图标缺失，可先运行 `python make_icon.py` 重新生成 `Evan_Gerber_View.ico / .png`。
 

@@ -153,11 +153,15 @@ def main():
     _files = [a for a in sys.argv[1:] if os.path.isfile(a)]
     if _files:
         def _open_argv():
-            for _i, _p in enumerate(_files):
-                try:
-                    viewer.add_layer(_p, fit_now=(_i == len(_files) - 1))
-                except Exception:      # noqa: BLE001
-                    pass
+            # 与界面导入一致: 后台解析、自动区分 Gerber/钻孔、可选带入同目录文件
+            paths = _files
+            try:
+                if viewer.auto_siblings.get():
+                    paths = viewer._expand_siblings(paths)
+            except Exception:          # noqa: BLE001
+                paths = _files
+            viewer._enqueue_parse(paths, do_fit=True)
+
         viewer.win.after(60, _open_argv)
 
     def _close():

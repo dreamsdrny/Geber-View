@@ -19,7 +19,7 @@ import os
 import re
 import threading
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -466,6 +466,14 @@ def _rot_points(points, deg: float):
     return [(x * cs - y * sn, x * sn + y * cs) for x, y in points]
 
 
+def _rot_points_about(points, cx: float, cy: float, deg: float):
+    """绕指定中心 (cx, cy) 旋转点集 (Gerber 宏图元的旋转参考点各不相同)"""
+    if not deg:
+        return list(points)
+    return [(x + cx, y + cy) for x, y in
+            _rot_points([(x - cx, y - cy) for x, y in points], deg)]
+
+
 def _regular_poly(cx, cy, dia, n, rot=0.0):
     n = max(3, int(n))
     r = dia / 2.0
@@ -473,17 +481,10 @@ def _regular_poly(cx, cy, dia, n, rot=0.0):
              cy + r * math.sin(math.radians(rot + k * 360.0 / n))) for k in range(n)]
 
 
-def _octagon_pts(cx, cy, w, h):
-    """近似下左八角形 (矩形切角)"""
-    cut = min(w, h) * (1 - 1 / math.sqrt(2)) / 2.0
-    x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
-    return [(x0 + cut, y0), (x1 - cut, y0), (x1, y0 + cut), (x1, y1 - cut),
-            (x1 - cut, y1), (x0 + cut, y1), (x0, y1 - cut), (x0, y0 + cut)]
-
-
 def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
                   x_mm: float, y_mm: float, rotation: float = 0.0,
-                  clear_default: bool = False, meta: Optional[dict] = None) -> List[dict]:
+                  clear_default: bool = False, meta: Optional[dict] = None,
+                  vec_mm=None) -> List[dict]:
     """把光圈宏在闪装点展开为标准图元 (draw/region/flash), 坐标单位 mm
 
     宏内所有尺寸按【文件单位】书写, 展开后统一乘以 unit_mm 换算成 mm。
@@ -503,6 +504,11 @@ def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
     def place(px, py):
         rx = px * cs - py * sn
         ry = px * sn + py * cs
+        # 宏内部几何必须跟随 %MI/%IR/%SF (镜像/旋转/图像比例), 不能只做平移;
+        # vec_mm 由调用方传入, 负责把文件单位向量换算成 mm 并应用上述变换。
+        if vec_mm is not None:
+            dx, dy = vec_mm(rx, ry)
+            return x_mm + dx, y_mm + dy
         return x_mm + rx * unit_mm, y_mm + ry * unit_mm
 
     def mk(t, **kw):
@@ -552,20 +558,23 @@ def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
                 q0, q1 = place(*p0), place(*p1)
                 mk("draw", x1=q0[0], y1=q0[1], x2=q1[0], y2=q1[1],
                    width=max(w * unit_mm, 1e-4), clear=clear_of(expo))
-            elif code == 21:                                # 矩形 (中心)
+            elif code == 21:                                # 矩形 (X,Y 为矩形中心)
                 expo = val(a[0]); w = val(a[1]); h = val(a[2])
                 cx = val(a[3]) if len(a) > 3 else 0.0
                 cy = val(a[4]) if len(a) > 4 else 0.0
                 rot = val(a[5]) if len(a) > 5 else 0.0
                 corners = [(cx - w / 2, cy - h / 2), (cx + w / 2, cy - h / 2),
                            (cx + w / 2, cy + h / 2), (cx - w / 2, cy + h / 2)]
-                poly(_rot_points(corners, rot), expo)
-            elif code == 22:                                # 八角形 (下左)
+                # 21 的旋转参考点是矩形中心
+                poly(_rot_points_about(corners, cx, cy, rot), expo)
+            elif code == 22:                                # 矩形 (X,Y 为左下角)
                 expo = val(a[0]); w = val(a[1]); h = val(a[2])
                 cx = val(a[3]) if len(a) > 3 else 0.0
                 cy = val(a[4]) if len(a) > 4 else 0.0
                 rot = val(a[5]) if len(a) > 5 else 0.0
-                poly(_rot_points(_octagon_pts(cx, cy, w, h), rot), expo)
+                corners = [(cx, cy), (cx + w, cy), (cx + w, cy + h), (cx, cy + h)]
+                # 22 的旋转参考点是左下角 (即 X,Y 本身)
+                poly(_rot_points_about(corners, cx, cy, rot), expo)
             elif code == 4:                                 # 轮廓多边形
                 expo = val(a[0]); cnt = int(val(a[1])) if len(a) > 1 else 0
                 coords = a[2:]
@@ -577,8 +586,7 @@ def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
                 for k in range(cnt):
                     if 2 * k + 1 < len(coords):
                         pts.append((val(coords[2 * k]), val(coords[2 * k + 1])))
-                if len(pts) >= 3 and pts[0] != pts[-1]:
-                    pass
+                # 轮廓多边形的旋转参考点是宏原点 (0,0); PIL 会自动闭合多边形
                 poly(_rot_points(pts, rot), expo)
             elif code == 5:                                 # 正多边形
                 expo = val(a[0]); cnt = val(a[1])
@@ -603,10 +611,13 @@ def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
                     if rad - thick > 0:
                         circle(cx, cy, (rad - thick) * 2, 0)
                     rad -= (thick + gap)
-                cross_t = val(a[7]) if len(a) > 7 else thick
-                cross_l = val(a[8]) if len(a) > 8 else outer
+                # 参数序: X,Y,外径,环厚,间隙,环数,十字线宽,十字线长,旋转角
+                cross_t = val(a[6]) if len(a) > 6 else thick
+                cross_l = val(a[7]) if len(a) > 7 else outer
+                crot = val(a[8]) if len(a) > 8 else 0.0
                 for ang in (0.0, 90.0):
-                    p0, p1 = _rot_points([(-cross_l / 2, 0), (cross_l / 2, 0)], ang)
+                    p0, p1 = _rot_points([(-cross_l / 2, 0), (cross_l / 2, 0)],
+                                         crot + ang)
                     q0, q1 = place(cx + p0[0], cy + p0[1]), place(cx + p1[0], cy + p1[1])
                     mk("draw", x1=q0[0], y1=q0[1], x2=q1[0], y2=q1[1],
                        width=max(cross_t * unit_mm, 1e-4), clear=clear_default)
@@ -684,6 +695,33 @@ def _shift_prim(prim: dict, dx: float, dy: float) -> dict:
     return p
 
 
+def _scale_aperture_params(ap: dict, factor: float, unit: str) -> list:
+    """按光圈形状缩放参数, 并统一换算到 mm。
+
+    - 光圈参数在解析结果中仍是文件单位 (英寸文件是 inch), 必须先 ×25.4 再乘 factor,
+      否则缩放后 unit 被改成 mm, 会再漏掉一次 25.4 (焊盘尺寸差 25.4 倍)。
+    - 多边形 P 的参数是 [直径, 边数, 旋转角], 只有直径是长度, 边数/角度不能缩放。
+    - 自定义宏的参数含义无法从数据本身判断, 按长度处理 (与原行为一致)。
+    """
+    params = list(ap.get("params") or [])
+    if not params:
+        return params
+    f = (INCH_TO_MM if unit == "inch" else 1.0) * factor
+    shape = str(ap.get("shape", "")).upper()
+    if shape == "P":
+        idxs = (0,)
+    elif shape in ("R", "O"):
+        idxs = tuple(range(min(len(params), 2)))
+    elif shape == "C":
+        idxs = (0,)
+    else:
+        idxs = tuple(range(len(params)))          # 宏光圈: 全部按长度缩放
+    for i in idxs:
+        if isinstance(params[i], (int, float)) and not isinstance(params[i], bool):
+            params[i] = params[i] * f
+    return params
+
+
 def scale_fab_data(data: dict, factor: float) -> dict:
     """按统一比例缩放已解析的制造数据 (坐标/线宽/光圈/孔径), 返回新 dict
 
@@ -717,11 +755,11 @@ def scale_fab_data(data: dict, factor: float) -> dict:
     b = data.get("bbox")
     if b and b[0] is not None:
         out["bbox"] = [v * factor if v is not None else None for v in b]
+    src_unit = str(data.get("unit") or "mm").lower()
     aps = {}
     for code, ap in (data.get("apertures") or {}).items():
         a = dict(ap)
-        a["params"] = [p * factor if isinstance(p, (int, float)) else p
-                       for p in (ap.get("params") or [])]
+        a["params"] = _scale_aperture_params(ap, factor, src_unit)
         aps[code] = a
     if data.get("apertures") is not None:
         out["apertures"] = aps
@@ -1087,7 +1125,8 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
                 d["aperture"] = ap_code
                 uf = unit_factor * ((img_scale[0] + img_scale[1]) / 2.0)
                 for p in _expand_macro(prims, ap.get("params") or [], uf,
-                                       x_mm, y_mm, 0.0, cur_negative, d):
+                                       x_mm, y_mm, 0.0, cur_negative, d,
+                                       vec_mm=vec):
                     emit(p, count_ap=False)
                 res.ap_usage[ap_code] = res.ap_usage.get(ap_code, 0) + 1
                 return
@@ -1622,8 +1661,12 @@ def _min_pad(res: GerberResult) -> Optional[float]:
 # ============================================================
 # Excellon NC Drill
 # ============================================================
-_DRILL_XY_RE = re.compile(r"^(?:G0*[0-9]\s*)?X([-+]?\d*\.?\d+)?\s*Y([-+]?\d*\.?\d+)?(.*)$",
-                          re.IGNORECASE)
+# X / Y 均可单独省略 (模态坐标), 只要至少出现一个坐标即可
+_DRILL_XY_RE = re.compile(
+    r"^(?:G0*[0-9]\s*)?"
+    r"(?:X([-+]?\d*\.?\d+))?\s*"
+    r"(?:Y([-+]?\d*\.?\d+))?\s*"
+    r"(.*)$", re.IGNORECASE)
 _DRILL_TOOL_RE = re.compile(r"^T(\d+)\s*C\s*([-+]?\d*\.?\d+)\s*(MM|MIL|MILS|INCH)?", re.IGNORECASE)
 
 
@@ -1746,12 +1789,15 @@ def parse_excellon(path: str, plating: Optional[str] = None,
     span = [None, None, None, None]
     units_seen: List[str] = []
 
-    def _track(v):
+    def _track(v, axis="x"):
         if v is None:
             return
-        span[0] = v if span[0] is None else min(span[0], v)
-        span[2] = v if span[2] is None else max(span[2], v)
+        lo, hi = (0, 2) if axis == "x" else (1, 3)
+        span[lo] = v if span[lo] is None else min(span[lo], v)
+        span[hi] = v if span[hi] is None else max(span[hi], v)
 
+    pass1_inc = False                 # G91 增量坐标
+    pos_x = pos_y = 0.0               # 增量模式下累积出的绝对位置
     for raw in lines:
         line = raw.strip()
         if not line:
@@ -1803,6 +1849,12 @@ def parse_excellon(path: str, plating: Optional[str] = None,
             if "," in up:
                 zero_declared = "T" if "TZ" in up else ("L" if "LZ" in up else zero_declared)
             continue
+        if up == "G91":
+            pass1_inc = True
+            continue
+        if up == "G90":
+            pass1_inc = False
+            continue
         m = _DRILL_TOOL_RE.match(line)
         if m:
             d = _num(m.group(2))
@@ -1824,23 +1876,40 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         m = _DRILL_XY_RE.match(line)
         if m and (m.group(1) or m.group(2)):
             coord_count += 1
-            for g in (m.group(1), m.group(2)):
+            for axis, g in (("x", m.group(1)), ("y", m.group(2))):
                 if not g:
                     continue
                 if "." in g:
                     has_decimal = True
+                    vnum = _num(g)
+                else:
+                    digits = g.lstrip("+-")
+                    if not digits.isdigit():
+                        continue
+                    token_count += 1
+                    max_digits = max(max_digits, len(digits))
+                    len_hist[len(digits)] = len_hist.get(len(digits), 0) + 1
+                    if digits.startswith("0"):
+                        lead_zero_tokens += 1
+                    if digits.endswith("0"):
+                        trailing_zero += 1
+                    vnum = int(g)
+                if vnum is None:
                     continue
-                digits = g.lstrip("+-")
-                if not digits.isdigit():
-                    continue
-                token_count += 1
-                max_digits = max(max_digits, len(digits))
-                len_hist[len(digits)] = len_hist.get(len(digits), 0) + 1
-                if digits.startswith("0"):
-                    lead_zero_tokens += 1
-                if digits.endswith("0"):
-                    trailing_zero += 1
-                _track(int(g))
+                if pass1_inc:
+                    # 增量坐标: 累积成绝对位置后再统计图幅, 否则 span 只是单步位移
+                    if axis == "x":
+                        pos_x += vnum
+                        _track(pos_x, "x")
+                    else:
+                        pos_y += vnum
+                        _track(pos_y, "y")
+                else:
+                    if axis == "x":
+                        pos_x = vnum
+                    else:
+                        pos_y = vnum
+                    _track(vnum, axis)
             continue
 
     span_raw = max([abs(v) for v in span if v is not None] or [0.0])
@@ -1930,7 +1999,8 @@ def parse_excellon(path: str, plating: Optional[str] = None,
     cur_tool: Optional[int] = None
     cur_unit = unit
     cur_x = cur_y = None
-    last_dx = last_dy = 0.0
+    inc_mode = False                       # G91 增量坐标
+    last_step = (0.0, 0.0)                 # 最近一次位移, 供独立成行的 R# 使用
     rout_on = False
     prev_point: Optional[Tuple[float, float]] = None
 
@@ -1956,10 +2026,16 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         if not line or line.startswith((";", "#", "//")):
             continue
         up = line.upper()
-        if up in ("M48", "%", "M95", "M30", "M31", "M00", "G90", "G91", "G05", "FMAT,2"):
+        if up in ("M48", "%", "M95", "M30", "M31", "M00", "G05", "FMAT,2"):
             continue
         if up.startswith("FMAT") or up.startswith("ICL") or up.startswith("VER") \
                 or up.startswith("DET") or up.startswith("REMARK"):
+            continue
+        if up == "G91":
+            inc_mode = True
+            continue
+        if up == "G90":
+            inc_mode = False
             continue
         if up.startswith("METRIC") or up == "M71":
             cur_unit = "mm"
@@ -1993,6 +2069,20 @@ def parse_excellon(path: str, plating: Optional[str] = None,
                     last["x2"] = ex if ex is not None else last["x"]
                     last["y2"] = ey if ey is not None else last["y"]
             continue
+        m = re.fullmatch(r"R0*(\d+)", up)
+        if m:
+            # R# 单独成行: 用最近一次位移重复上一个孔
+            cnt = max(0, int(m.group(1)) - 1)
+            if holes and (last_step[0] or last_step[1]):
+                rx_, ry_ = holes[-1].get("x"), holes[-1].get("y")
+                if rx_ is not None and ry_ is not None:
+                    for _ in range(min(cnt, 10000)):
+                        rx_ += last_step[0]
+                        ry_ += last_step[1]
+                        add_hole(rx_, ry_)
+                    cur_x, cur_y = rx_, ry_
+                    prev_point = (rx_, ry_)
+            continue
         m = _DRILL_XY_RE.match(line)
         if not m or not (m.group(1) or m.group(2)):
             continue
@@ -2000,28 +2090,52 @@ def parse_excellon(path: str, plating: Optional[str] = None,
             cur_tool = 1
         x = conv(m.group(1))
         y = conv(m.group(2))
+        if inc_mode:
+            # 增量坐标: 坐标是相对上一个孔的位移
+            if x is not None:
+                x = (cur_x + x) if cur_x is not None else x
+            if y is not None:
+                y = (cur_y + y) if cur_y is not None else y
         nx = x if x is not None else cur_x
         ny = y if y is not None else cur_y
         tail = (m.group(3) or "").upper()
-        if rout_on and prev_point is not None and (nx is not None and ny is not None):
+
+        # 内联槽孔: X..Y..G85X..Y.. (起点与终点在同一行)
+        slot_to = None
+        if "G85" in tail and nx is not None and ny is not None:
+            seg = tail.split("G85", 1)[1]
+            sx = re.search(r"X([-+]?\d*\.?\d+)", seg)
+            sy = re.search(r"Y([-+]?\d*\.?\d+)", seg)
+            ex = conv(sx.group(1)) if sx else None
+            ey = conv(sy.group(1)) if sy else None
+            if ex is not None or ey is not None:
+                slot_to = (ex if ex is not None else nx,
+                           ey if ey is not None else ny)
+
+        # 本次位移 (相对上一个孔; 省略的轴视为 0) -> R# 按该位移递增
+        step_dx = (nx - cur_x) if (nx is not None and cur_x is not None) else 0.0
+        step_dy = (ny - cur_y) if (ny is not None and cur_y is not None) else 0.0
+        rep_step = (step_dx, step_dy)
+        if not rep_step[0] and not rep_step[1]:
+            rep_step = last_step          # 当前行没有位移时沿用上一次位移
+
+        if slot_to is not None:
+            add_hole(nx, ny, slot_to=slot_to)
+        elif rout_on and prev_point is not None and (nx is not None and ny is not None):
             add_hole(prev_point[0], prev_point[1], slot_to=(nx, ny))
         elif nx is not None and ny is not None:
             add_hole(nx, ny)
         rep = re.search(r"R0*(\d+)", tail)
         if rep and nx is not None and ny is not None:
             cnt = max(0, int(rep.group(1)) - 1)
+            rx_, ry_ = nx, ny
             for _ in range(min(cnt, 10000)):
-                nx += last_dx
-                ny += last_dy
-                add_hole(nx, ny)
-        if x is not None and cur_x is not None:
-            last_dx = x
-        if y is not None and cur_y is not None:
-            last_dy = y
-        if x is not None and y is not None:
-            last_dx, last_dy = 0.0, 0.0
-            if cur_x is not None and cur_y is not None:
-                last_dx, last_dy = x - cur_x, y - cur_y
+                rx_ += rep_step[0]
+                ry_ += rep_step[1]
+                add_hole(rx_, ry_)
+            nx, ny = rx_, ry_          # 重复结束后当前点位于最后一个孔
+        if rep_step[0] or rep_step[1]:
+            last_step = rep_step
         prev_point = (nx, ny) if (nx is not None and ny is not None) else prev_point
         cur_x = nx if nx is not None else cur_x
         cur_y = ny if ny is not None else cur_y

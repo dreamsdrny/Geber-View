@@ -33,7 +33,8 @@ from branding import win_title
 # 文件对话框后缀: 覆盖常见 CAM/制程量测导出格式 (无需再选 "All files")
 _GERBER_PATTERNS = (
     "*.gbr *.ger *.art *.pho *.gdo *.gbx *.gbz *.gko *.gml "
-    "*.g? *.g?? *.gp? *.gp?? *.gm? *.gm?? "
+    # *.g* 覆盖 .g1..g99 / .gp1 / .gm2 等制程量测/CAM 常见后缀
+    "*.g* "
     "*.gtl *.gbl *.gto *.gbo *.gts *.gbs *.gtp *.gbp")
 _DRILL_PATTERNS = "*.drl *.drill *.nc *.ncd *.xln *.exc *.tap *.txt"
 
@@ -465,9 +466,12 @@ class GerberViewer:
     def _build(self):
         top = ttk.Frame(self.win, padding=6)
         top.pack(fill=tk.X)
-        ttk.Button(top, text="导入Gerber...", command=self._import_gerber).pack(side=tk.LEFT)
-        ttk.Button(top, text="导入钻孔...", command=self._import_drill).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="导入全部(目录)...", command=self._import_dir).pack(side=tk.LEFT)
+        ttk.Button(top, text="导入文件夹(自动)...", command=self._import_dir).pack(side=tk.LEFT)
+        ttk.Button(top, text="导入Gerber文件...", command=self._import_gerber).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="导入钻孔...", command=self._import_drill).pack(side=tk.LEFT)
+        self.auto_siblings = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="自动带入同目录",
+                        variable=self.auto_siblings).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(top, text="对比A: 导入多层", command=lambda: self._compare_load("A")).pack(side=tk.LEFT)
         ttk.Button(top, text="对比B: 导入多层", command=lambda: self._compare_load("B")).pack(side=tk.LEFT, padx=4)
@@ -630,7 +634,7 @@ class GerberViewer:
                         data = parse_excellon(p)
                     else:
                         data = parse_gerber(p, layer_name=base)
-                    self._ui_q.put(("layer", data, p, group))
+                    self._ui_q.put(("layer", data, p, group, len(paths)))
                 except Exception as exc:  # noqa: BLE001
                     self._ui_q.put(("parse_err", base, str(exc)))
             self._ui_q.put(("parse_done", len(paths), group))
@@ -687,15 +691,17 @@ class GerberViewer:
         if t == "status":
             self.status.set(msg[1])
         elif t == "layer":
-            _, data, path, group = msg
+            _, data, path, group, batch_size = msg
             # 批量导入时先不进 Treeview, 等 parse_done 一次性重建 (原来每层都重建整表)
-            self._add_layer_data(data, path, group, refresh=False)
+            self._add_layer_data(data, path, group, refresh=False,
+                                 batch_size=batch_size)
         elif t == "parse_err":
             self.status.set(f"解析失败: {msg[1]} — {msg[2]}")
         elif t == "parse_done":
             _, _n, group = msg
             self._batch = max(0, self._batch - _n)
             if self._batch == 0:
+                self._promote_bottom_copper()                    # 铜层最高层号 -> 底层
                 self._refresh_list()                            # 全部解析完成后只重建一次
                 notes = self._auto_check_scales(True, True)      # 单位/格式差异自动校正
                 if group in ("A", "B") and any(l.group == "A" for l in self.layers) \
@@ -703,10 +709,15 @@ class GerberViewer:
                     self._align_group_b_to_a()
                 if self._batch_fit:
                     self.fit()
+                hidden = sum(1 for l in self.layers if not l.visible)
                 self.status.set(
-                    f"已导入 {len(self.layers)} 层 — 点『开/关』列切换显示 (滚轮缩放/右键平移)")
+                    f"已导入 {len(self.layers)} 层"
+                    + (f"，自动隐藏 {hidden} 个次要层" if hidden else "")
+                    + " — 点『开/关』列切换 (滚轮缩放/右键平移)")
                 if notes:
                     self.info.set("；".join(notes)[:200])
+                elif hidden:
+                    self.info.set("已自动隐藏内层铜/钢网/盲埋孔; 点『全开』可全部显示")
         elif t == "base":
             _, token, img, scale, lb = msg
             for ly in self.layers:
@@ -763,7 +774,7 @@ class GerberViewer:
             return _TYPE_COLOR.get(("drill", key), "#ffffff")
         return _TYPE_COLOR.get((k, side), _PALETTE[len(self.layers) % len(_PALETTE)])
 
-    def _add_layer_data(self, data, path, group, refresh=True):
+    def _add_layer_data(self, data, path, group, refresh=True, batch_size=1):
         name = os.path.basename(path)
         if group:
             name = f"[{group}] {name}"
@@ -772,8 +783,16 @@ class GerberViewer:
         ly.role = data.get("_role") or ly.role
         if data.get("kind") == "drill":
             ly.kind = "drill"
-        # 单层导入默认可见; 批量(>1)时保持可见, 由渲染缓存保证流畅
+        # 批量导入整目录时, 默认隐藏次要层 (内层铜/钢网/盲埋孔), 避免 19 层全叠在一起;
+        # 单层或少量文件仍全部显示, 用户可随时点『全开』。
+        # 用本次导入的文件数判断, 避免小导入排在大的导入任务后面时被误隐藏。
         ly.visible = True
+        if not group and batch_size > 8:
+            r = ly.role or {}
+            if (r.get("kind") == "paste"
+                    or (r.get("kind") == "copper" and r.get("side") == "inner")
+                    or (r.get("kind") == "drill" and r.get("via"))):
+                ly.visible = False
         self.layers.append(ly)
         self._recompute_view_bbox()
         self.selected = len(self.layers) - 1
@@ -781,7 +800,32 @@ class GerberViewer:
             self._refresh_list()
             self._sync_selection()
             self._schedule_render()
-        self._request_base(ly)
+        if ly.visible:
+            self._request_base(ly)
+
+    def _promote_bottom_copper(self):
+        """铜层命名只给了层号时: 最高层号(如 l8p / l4p)按底层显示并着色。
+
+        层号 1 已在识别阶段判为顶层; 其余内层随批量解析完成后才统一提升,
+        这样 2/4/8 层板都能得到正确的顶层/底层颜色。
+        """
+        cu = [l for l in self.layers if not l.group
+              and (l.role or {}).get("kind") == "copper"
+              and (l.role or {}).get("index")
+              and not (l.role or {}).get("explicit_side")]
+        if len(cu) < 2:
+            return
+        max_idx = max(int(l.role.get("index")) for l in cu)
+        for ly in cu:
+            if int(ly.role.get("index")) != max_idx:
+                continue
+            if ly.role.get("side") == "bottom":
+                continue
+            ly.role["side"] = "bottom"
+            ly.color = _TYPE_COLOR.get(("copper", "bottom"), ly.color)
+            if not ly.visible:
+                ly.visible = True
+            self._invalidate(ly)          # 颜色已烘焙进位图 -> 粗/高清缓存都要作废
 
     def add_layer(self, path, color=None, name=None, fit_now=True):
         data = parse_gerber(path, layer_name=name or os.path.basename(path))
@@ -829,26 +873,80 @@ class GerberViewer:
 
     def _import_gerber(self):
         paths = filedialog.askopenfilenames(
-            title="导入 Gerber 文件 (可多选, 已含制程量测常用格式)",
-            filetypes=[("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
+            title="导入 Gerber 文件 (选一个即可自动带入同目录全部 Gerber)",
+            filetypes=[("Gerber/钻孔 (自动识别, 含无后缀)", "*"),
+                       ("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
                        ("Gerber", _GERBER_PATTERNS),
                        ("钻孔 NC Drill", _DRILL_PATTERNS),
                        ("All files", "*.*")])
+        if paths and self.auto_siblings.get():
+            paths = self._expand_siblings(paths)
         self._enqueue_parse(paths)
 
     def _import_drill(self):
         paths = filedialog.askopenfilenames(
             title="导入钻孔 (NC Drill, 可多选)",
             filetypes=[("钻孔 NC Drill", _DRILL_PATTERNS),
-                       ("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
+                       ("Gerber/钻孔 (自动识别, 含无后缀)", "*"),
                        ("All files", "*.*")])
+        if paths and self.auto_siblings.get():
+            paths = self._expand_siblings(paths)
         self._enqueue_parse(paths)
 
     def _import_dir(self):
-        d = filedialog.askdirectory(title="导入目录下全部 Gerber/钻孔 (按内容自动识别)")
+        d = filedialog.askdirectory(title="导入文件夹: 自动识别全部 Gerber/钻孔 (含无后缀)")
         if not d:
             return
         self._enqueue_parse(self._gather_dir(d))
+
+    def _expand_siblings(self, paths):
+        """选一个文件后自动带上同目录的 Gerber/钻孔 (CAM 导出常无后缀)。
+
+        最多补 200 个, 防止误选一个包含大量无关文件的目录。
+        """
+        out = []
+        seen = set()
+
+        def add(p):
+            ap = os.path.abspath(p)
+            if ap not in seen:
+                seen.add(ap)
+                out.append(p)
+
+        dirs = set()
+        for p in paths:
+            try:
+                if detect_file_kind(p) is None:
+                    continue
+            except OSError:
+                continue
+            add(p)
+            dirs.add(os.path.dirname(os.path.abspath(p)))
+        if not out:
+            self.status.set("所选文件不是可识别的 Gerber/钻孔文件")
+            return out
+        extra = 0
+        for d in dirs:
+            try:
+                with os.scandir(d) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+            except OSError:
+                continue
+            for e in entries:
+                if extra >= 200:
+                    break
+                if not e.is_file():
+                    continue
+                try:
+                    if detect_file_kind(e.path) is None:
+                        continue
+                except OSError:
+                    continue
+                before = len(out)
+                add(e.path)
+                if len(out) > before:
+                    extra += 1
+        return out
 
     def _gather_dir(self, d):
         """收集目录下全部 Gerber/钻孔 (识别后缀+文件头, 无后缀也能找到)"""
@@ -880,12 +978,34 @@ class GerberViewer:
         self._enqueue_parse(paths, group=group, do_fit=True)
         self.info.set(f"对比模式: 已载入 {group} 组 {len(paths)} 层 — 载入 A、B 后点『自动定位差异』")
 
+    def _drop_layer_refs(self, removed=None):
+        """断开 Solo / 网络高亮对已删除图层对象的引用。
+
+        removed=None 表示清空全部图层; 否则只移除指定图层。
+        不清理会让 _layer_on() 在清空后继续返回 False, 新导入的图层全部不显示。
+        """
+        if removed is None:
+            self._solo = None
+            self._hl = None
+        else:
+            if self._solo is removed:
+                self._solo = None
+            if self._hl:
+                items = [it for it in (self._hl.get("items") or [])
+                         if it and it[0] is not removed]
+                self._hl = ({"net": self._hl.get("net", ""), "items": items}
+                            if items else None)
+        self._last_img = None
+
     def _clear(self):
+        self._drop_layer_refs()
         self.layers = []
         self.selected = None
         self.diff_points = []
         self._group_idx = {"A": 0, "B": 0}
         self._batch = 0
+        self._measure_pts = []
+        self._measure_cur = None
         self._recompute_view_bbox()
         self._refresh_list()
         self._schedule_render()
@@ -1022,15 +1142,19 @@ class GerberViewer:
         self._schedule_render()
 
     def _img_bytes(self, ly):
-        try:
-            w, h = ly.base_img.size
-            return w * h          # L 掩膜: 1 字节/像素
-        except Exception:  # noqa: BLE001
-            return 0
+        total = 0
+        for im in (ly.base_img, ly.detail_img):
+            try:
+                w, h = im.size
+                total += w * h      # L 掩膜: 1 字节/像素
+            except Exception:  # noqa: BLE001
+                continue
+        return total
 
     def _evict_cache(self):
         """隐藏层位图按 LRU 保留 (便于瞬时开关), 总内存超预算时释放最久未用的隐藏层"""
-        cached = [l for l in self.layers if l.base_img is not None]
+        cached = [l for l in self.layers
+                  if l.base_img is not None or l.detail_img is not None]
         if not cached:
             return
         total = sum(self._img_bytes(l) for l in cached)
@@ -1043,6 +1167,9 @@ class GerberViewer:
             total -= self._img_bytes(l)
             l.base_img = None
             l.solid = None
+            l.detail_img = None
+            l.detail_token += 1
+            l.detail_pending = False
             l.pending = False
 
     def _move_layer(self, direction):
@@ -1058,7 +1185,8 @@ class GerberViewer:
 
     def _delete_sel(self):
         if self.selected is not None and 0 <= self.selected < len(self.layers):
-            self.layers.pop(self.selected)
+            removed = self.layers.pop(self.selected)
+            self._drop_layer_refs(removed)
             self.selected = len(self.layers) - 1 if self.layers else None
             self._recompute_view_bbox()
             self._refresh_list()
@@ -1687,12 +1815,15 @@ class GerberViewer:
                 wd = rec[b + 5]
                 ap = int(rec[b + 6])
                 if t == 1:                                 # flash
-                    if ap_cache is not None and ap in ap_cache:
-                        shape, fw, fh, edges, rot = ap_cache[ap]
+                    # 宏光圈展开后的 flash 光圈码统一为 0, 但每个图元的 width 不同
+                    # (圆/环/靶标由多个不同直径组成), 只按光圈码缓存会全部用第一个直径。
+                    ap_key = (ap, round(wd, 6))
+                    if ap_cache is not None and ap_key in ap_cache:
+                        shape, fw, fh, edges, rot = ap_cache[ap_key]
                     else:
                         shape, fw, fh, edges, rot = self._ap_shape_data(data, ap, wd)
                         if ap_cache is not None:
-                            ap_cache[ap] = (shape, fw, fh, edges, rot)
+                            ap_cache[ap_key] = (shape, fw, fh, edges, rot)
                     cx, cy = T(x1, y1)
                     if clip is not None:
                         m = max(fw, fh) / 2 * scale + 2
@@ -2375,26 +2506,30 @@ class GerberViewer:
     # ---------------- 导出 ----------------
     def _export_png(self):
         try:
-            from PIL import Image
+            Image, ImageDraw, _ = self._PIL()
         except Exception:
             messagebox.showerror("导出失败", "未安装 Pillow")
             return
-        bbox = self._bbox_all()
-        if not bbox:
+        # 与画面保持一致: Solo 生效时只导出被隔离的图层
+        vis = [l for l in self.layers if self._layer_on(l) and l.local_bbox()]
+        if not vis:
+            vis = [l for l in self.layers if l.visible and l.local_bbox()]
+        if not vis:
+            vis = [l for l in self.layers if l.local_bbox()]
+        boxes = [b for b in (l.bbox() for l in vis) if b]
+        if not boxes:
             messagebox.showinfo("导出", "没有可导出的图层")
             return
+        bbox = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes))
         path = filedialog.asksaveasfilename(title="导出 PNG", defaultextension=".png",
                                             initialfile="gerber_view.png",
                                             filetypes=[("PNG", "*.png")])
         if not path:
             return
-        vis = [l for l in self.layers if l.visible and l.local_bbox()]
-        if not vis:
-            vis = [l for l in self.layers if l.local_bbox()]
         W, H = 2000, 1400
         w = max(bbox[2] - bbox[0], 1e-6); h = max(bbox[3] - bbox[1], 1e-6)
         scale = min(W / w, H / h) * 0.94
-        Image, ImageDraw, _ = self._PIL()
         ow = max(1, int(w * scale)); oh = max(1, int(h * scale))
         img = Image.new("RGBA", (ow, oh), BG_RGB + (255,))
         draw = ImageDraw.Draw(img)

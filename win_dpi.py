@@ -9,7 +9,8 @@ Evan Gerber View: Windows 高 DPI 支持
 import ctypes
 import sys
 
-APP_USER_MODEL_ID = "Evan.Gerber.View.App"
+# AppUserModelID 以 branding 为单一来源, 避免两处常量不一致
+from branding import APP_USER_MODEL_ID
 
 
 def enable_dpi_awareness() -> None:

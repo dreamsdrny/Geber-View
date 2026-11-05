@@ -70,7 +70,7 @@ NAME_RULES: list[LayerRule] = [
             r"npth",
             r"non[_\-]?plated",
             r"npt(?=[\._\-])",
-            r"pth",
+            r"(?<![a-z])pth",          # 避免 depth/nepth 之类普通词被当成 PTH
             r"plated",
             r"drill",
             r"\.drl$",
@@ -158,8 +158,8 @@ NAME_RULES: list[LayerRule] = [
             r"silkscreen[_\-]?top",
             r"top[_\-]?silk",
             r"silk[_\-]?top",
-            r"legend",
-            r"overlay",
+            r"legend[_\-]?top",
+            r"overlay[_\-]?top",
             r"\.gto$",
             r"\-f\.silks",
             r"\.plc$",
@@ -178,6 +178,8 @@ NAME_RULES: list[LayerRule] = [
             r"silkscreen[_\-]?bottom",
             r"bot[_\-]?silk",
             r"bottom[_\-]?silk",
+            r"legend[_\-]?bot",
+            r"overlay[_\-]?bot",
             r"\.gbo$",
             r"\-b\.silks",
             r"\.pls$",
@@ -202,7 +204,7 @@ NAME_RULES: list[LayerRule] = [
             r"paste[_\-]?top",
             r"top[_\-]?paste",
             r"stencil[_\-]?top",
-            r"solder[_\-]?paste",
+            r"solder[_\-]?paste[_\-]?top",
             r"\.gtp$",
             r"\-f\.paste",
         ],
@@ -414,10 +416,89 @@ def _parse_x2_file_function(file_function: str, name: str) -> Optional[dict]:
 # 文件名规则匹配
 # ---------------------------------------------------------------------------
 
+def _match_cam_convention(filename: str) -> Optional[dict]:
+    """识别部分 CAM/制程量测导出的短名约定 (常无扩展名)。
+
+    例: l1p / l2pt / l4pb (铜层), m1p / m8p (阻焊), r1n / r8n (丝印),
+        tp / bp (锡膏), bvh1-2 / ivh2-7 (盲埋孔), drp (钻孔), nth (外形)。
+    """
+    base = os.path.basename(filename)
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    low = stem.lower()
+
+    m = re.fullmatch(r"l(\d+)p([bt])?", low)
+    if m:
+        idx = int(m.group(1))
+        suffix = (m.group(2) or "").lower()
+        if suffix == "t":
+            side = SIDE_TOP
+        elif suffix == "b":
+            side = SIDE_BOTTOM
+        else:
+            side = SIDE_TOP if idx == 1 else SIDE_INNER
+        return {
+            "kind": KIND_COPPER,
+            "side": side,
+            "index": idx,
+            "name": filename,
+            "source": SOURCE_NAME,
+            # 文件名已显式给出顶/底时不参与“最高层号提升为底层”的推断
+            "explicit_side": bool(suffix),
+        }
+
+    m = re.fullmatch(r"m(\d+)p", low)
+    if m:
+        idx = int(m.group(1))
+        return {
+            "kind": KIND_MASK,
+            "side": SIDE_TOP if idx == 1 else SIDE_BOTTOM,
+            "index": None,
+            "name": filename,
+            "source": SOURCE_NAME,
+        }
+
+    m = re.fullmatch(r"r(\d+)n", low)
+    if m:
+        idx = int(m.group(1))
+        return {
+            "kind": KIND_SILK,
+            "side": SIDE_TOP if idx == 1 else SIDE_BOTTOM,
+            "index": None,
+            "name": filename,
+            "source": SOURCE_NAME,
+        }
+
+    if low == "tp":
+        return {"kind": KIND_PASTE, "side": SIDE_TOP, "index": None,
+                "name": filename, "source": SOURCE_NAME}
+    if low == "bp":
+        return {"kind": KIND_PASTE, "side": SIDE_BOTTOM, "index": None,
+                "name": filename, "source": SOURCE_NAME}
+
+    if re.fullmatch(r"(?:b|i)vh\d+-\d+", low):
+        return {"kind": KIND_DRILL, "side": SIDE_UNKNOWN, "index": None,
+                "name": filename, "source": SOURCE_NAME, "plated": True,
+                "via": True}
+
+    if low in ("drp", "drl", "drill"):
+        return {"kind": KIND_DRILL, "side": SIDE_UNKNOWN, "index": None,
+                "name": filename, "source": SOURCE_NAME, "plated": True}
+
+    if low in ("nth", "outline", "oln"):
+        return {"kind": KIND_PROFILE, "side": SIDE_UNKNOWN, "index": None,
+                "name": filename, "source": SOURCE_NAME}
+
+    return None
+
+
 def _match_by_filename(filename: str) -> dict:
     """按文件名规则匹配层类型。"""
 
     low = filename.lower()
+
+    special = _match_cam_convention(filename)
+    if special is not None:
+        return special
 
     for rule in _NAME_RULES_SORTED:
         if rule.match(low):
