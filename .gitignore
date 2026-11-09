@@ -15,3 +15,12 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 回归测试的临时夹具（正常写在系统临时目录里；临时目录不可写时会被迫写在当前目录）
+_rg_*.gbr
+_rg_*.drl
+egv_test_*/
+l1p
+l1pb
+l4p
+l8pt

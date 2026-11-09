@@ -59,23 +59,48 @@ python -m PyInstaller --clean --noconfirm Evan_Gerber_View_onefile.spec
 | 产物 | 优点 | 局限 |
 | --- | --- | --- |
 | **目录版** `dist/Evan_Gerber_View/`（整个文件夹） | 启动即可用，**不做运行时解压**，最快、最不容易被安全软件拦；整目录拷贝即可分发 | 必须整个文件夹一起拷，不能只拷 exe |
-| 单文件版 `dist/Evan_Gerber_View.exe` | 只有一个文件，方便传阅 | 每次启动都要先把内容解压到 `%TEMP%`；若临时目录不可写/被安全软件拦截，会弹 `Error` 框打不开 |
+| 单文件版 `dist/Evan_Gerber_View.exe` | 只有一个文件，方便传阅 | 每次启动都要先把内容解压到 `%TEMP%`；**若 exe 带 Windows「低完整性标签」则解压失败、弹 `Error` 框打不开**（见下一节，用 `启动单文件版.bat` 解决） |
 
-### 双击 exe 弹出标题为 `Error` 的框 / 打不开？
+### 双击单文件版 exe 弹出标题为 `Error` 的框 / 打不开？
 
-单文件版启动时由 PyInstaller 引导程序把依赖解压到临时目录，解压失败时就会弹这种框（典型报错
-`Failed to extract ... fopen: Permission denied`）。这不是 Gerber 数据的问题，按下面任一方式即可打开：
+真实原因（已实测复现）：
 
-1. **直接用目录版**：`dist\Evan_Gerber_View\Evan_Gerber_View.exe`（不依赖运行时解压，最稳）。
-2. **把临时目录指到可写位置再启动单文件版**：新建 `启动.bat`，内容如下，双击它即可：
-   ```bat
-   @echo off
-   set "TEMP=%LOCALAPPDATA%\Evan_Gerber_View\tmp"
-   set "TMP=%TEMP%"
-   if not exist "%TEMP%" mkdir "%TEMP%"
-   start "" "%~dp0Evan_Gerber_View.exe" %*
-   ```
-3. **检查安全软件**：把程序目录/该 exe 加入白名单（不少企业安全策略禁止"从临时目录解压并执行"）。
+本仓库所在的 `D:\Evan\View-Gerber` 目录被沙箱工具打上了 Windows 的**低完整性标签**
+（`icacls` 里能看到 `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`），**该目录下所有文件都会继承它**。
+**Windows 会让带这个标签的 exe 以「低完整性进程」运行**——实测把 `whoami.exe` 复制进工作区后，
+它自报 `S-1-16-4096`（Low）；放在工作区外则是 `S-1-16-8192`（Medium）。而**低完整性进程写不了
+`%TEMP%`**（默认 Medium，且默认策略禁止向上写），于是：
+
+* **单文件版**：PyInstaller 引导程序要先在 `%TEMP%` 里建 `_MEIxxxx` 解压目录 → 创建被拒绝 → 弹出
+  标题 `Error`、内容 `Could not create temporary directory!` 的框，程序在解压前就退出；
+* **目录版**：不做运行时解压，所以照常打开；
+* 同一个 exe 只要复制到工作区外（桌面、`%LOCALAPPDATA%` 等），就以 Medium 权限运行，立刻正常。
+
+实测对照：
+
+| exe 放置位置 | 结果 |
+| --- | --- |
+| `D:\Evan\View-Gerber\dist\Evan_Gerber_View.exe` | ❌ 弹 `Error`（`Could not create temporary directory!`） |
+| 同一文件复制到 `C:\egv_test\` / `D:\egv_test\` / `%TEMP%` / `%LOCALAPPDATA%` | ✅ 正常打开 |
+| 目录版 `dist\Evan_Gerber_View\Evan_Gerber_View.exe`（仍在工作区内） | ✅ 正常打开（不做运行时解压） |
+
+按下面任一方式即可打开：
+
+1. **双击 `启动单文件版.bat`（推荐）**：它把 `dist\Evan_Gerber_View.exe` 复制到工作区外的
+   `%LOCALAPPDATA%\Evan_Gerber_View\` 再启动，直接绕开低完整性标签。
+2. **手动复制出来再双击**：把 `dist\Evan_Gerber_View.exe` 拷到桌面、下载目录等普通文件夹即可。
+   注意：**再拷回工作区内会重新继承标签，又会打不开**。
+3. **直接用目录版**：`dist\Evan_Gerber_View\Evan_Gerber_View.exe`（最稳，不受该标签影响）。
+
+> 若想在工作区内直接双击单文件版：要以**管理员身份**去掉工作区根目录上的低完整性标签，然后
+> **重新打包/重新复制** exe（已存在的文件不会自动改标签）：
+> ```
+> icacls "D:\Evan\View-Gerber" /setintegritylevel (OI)(CI)Medium
+> ```
+> 本会话没有管理员权限，这条命令尚未实测；沙箱工具后续也可能再次给工作区打标签。
+
+> 附带影响：在工作区内直接跑 `python` 时，`tempfile.gettempdir()` 会退化成当前目录（因为 `%TEMP%`
+> 写不进去），测试临时文件会掉在仓库根目录里；`test_gui.py` 已改为使用独立临时目录并在结束时删除。
 
 若程序启动时抛异常，会在 exe 同级目录写 `Evan_Gerber_View_crash.log`（不可写时写到
 `%LOCALAPPDATA%\Evan_Gerber_View\crash.log`），排查"打不开"时先看这个日志。
@@ -112,7 +137,8 @@ test_gui.py                   端到端回归 (解析 + 真实 Tk 渲染)
 tools/smoke_test_exe.ps1      冒烟测试: 验证打包出的 exe 真的能打开
 Evan_Gerber_View.spec         目录版打包配置
 Evan_Gerber_View_onefile.spec 单文件版打包配置
-build.bat                     一键打包脚本
+build.bat                     一键打包脚本（目录版）
+启动单文件版.bat               单文件版启动器: 复制到工作区外再运行, 绕开低完整性标签导致打不开的问题
 .github/workflows/build.yml   GitHub Actions: 回归 + 打包 + exe 冒烟测试
 ```
 

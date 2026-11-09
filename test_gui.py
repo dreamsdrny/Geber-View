@@ -2,6 +2,7 @@
 """端到端回归: 真实 Tk 窗口 + 渲染 + 高亮 + Solo + 测距 + 性能数字"""
 import io
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -11,6 +12,15 @@ import tkinter as tk
 
 from gerber_reader import parse_excellon, parse_gerber, scale_fab_data
 import gerber_viewer as gv
+
+# GitHub Actions 的 Windows runner 上，控制台默认不是 UTF-8（cp1252），
+# 直接 print 中文会抛 UnicodeEncodeError 让整个回归误判为失败；
+# 这里把标准输出/错误流强制为 UTF-8，任何平台都能稳定打印。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 _FAILS = []
@@ -146,7 +156,10 @@ def make_nets(path):
 
 
 def main():
-    tmp = tempfile.gettempdir()
+    # 用独立的临时目录，跑完就删掉。不用 gettempdir() 直接落文件：
+    # 在"低完整性"环境里（例如本工作区被打了 Low Mandatory Label）%TEMP% 不可写，
+    # Python 会把临时目录退化成当前目录，夹具就会掉在仓库根目录里。
+    tmp = tempfile.mkdtemp(prefix='egv_test_')
     test_parsers(tmp)
 
     fp1 = os.path.join(tmp, '_rg_net.gbr')
@@ -369,6 +382,7 @@ def main():
         check("macro ap_cache diameters", render({}) == render(None))
 
     root.destroy()
+    shutil.rmtree(tmp, ignore_errors=True)
     return 1 if _FAILS else 0
 
 

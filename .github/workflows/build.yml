@@ -44,6 +44,10 @@ jobs:
           python -m compileall -q Evan_Gerber_View.py gerber_viewer.py gerber_reader.py gerber_layer.py gerber_native.py win_dpi.py branding.py test_gui.py
 
       - name: 回归测试 (解析器 + Tk 渲染)
+        # runner 控制台不是 UTF-8，强制 Python 用 UTF-8 输出，避免打印中文时 UnicodeEncodeError
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
         run: python test_gui.py
 
       - name: 打包目录版 (dist/Evan_Gerber_View/Evan_Gerber_View.exe)
@@ -55,6 +59,8 @@ jobs:
       - name: 冒烟测试 — exe 必须真的能打开
         shell: pwsh
         run: |
+          # 某些机器/镜像默认禁止运行 .ps1，这里只对本进程放开
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
           ./tools/smoke_test_exe.ps1 -Exe 'dist\Evan_Gerber_View\Evan_Gerber_View.exe','dist\Evan_Gerber_View.exe'
 
       - name: 上传产物 (目录版 + 单文件版)

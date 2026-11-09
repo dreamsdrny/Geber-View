@@ -19,6 +19,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 兼容两种调用方式:
+#   Windows PowerShell: -Exe 'a','b'  会整体当成一个字符串传进来
+#   PowerShell 7:       -Exe 'a','b'  是真正的数组
+$Exe = @($Exe | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } |
+         Where-Object { $_ })
+
 $name = 'Evan_Gerber_View'
 $problems = New-Object System.Collections.Generic.List[string]
 
