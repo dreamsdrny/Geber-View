@@ -53,6 +53,15 @@ python -m PyInstaller --clean --noconfirm Evan_Gerber_View_onefile.spec
 - 单文件版：`dist/Evan_Gerber_View.exe`（约 17MB，首次启动会解压到临时目录，略慢 1~2 秒）
 
 > 若图标缺失，可先运行 `python make_icon.py` 重新生成 `Evan_Gerber_View.ico / .png`。
+>
+> **Rust 原生解析内核（可选）**：`rust/gerber_core` 编译出的 `gerber_core.pyd` 不在 git 里
+> （被 `.gitignore` 忽略），缺了也能跑（自动回退纯 Python）。想启用加速就先编译：
+> ```bash
+> cd rust/gerber_core
+> cargo build --release
+> copy target\release\gerber_core.dll gerber_core.pyd
+> ```
+> 两个 spec 都是"有就打包、没有就跳过"，所以干净检出（CI / 新克隆）也能直接打包。
 
 ### 该用哪个产物？
 
@@ -108,8 +117,9 @@ python -m PyInstaller --clean --noconfirm Evan_Gerber_View_onefile.spec
 ### 持续集成（GitHub Actions）
 
 推送到 `main` 会触发 [build-and-test](.github/workflows/build.yml)：语法检查 → 回归测试
-（解析器 + 真实 Tk 渲染）→ 打包目录版与单文件版 → **冒烟测试（两个 exe 必须真的能打开）** →
-上传构建产物（Actions 页面里的 `Evan_Gerber_View-windows-x64`）。
+（解析器 + 真实 Tk 渲染）→ 编译 Rust 原生内核（可选，失败不阻塞）→ 打包目录版与单文件版 →
+**冒烟测试（两个 exe 必须真的能打开）** → 上传构建产物（Actions 页面里的
+`Evan_Gerber_View-windows-x64`，含单文件版、目录版和 `启动单文件版.bat`）。
 
 ## 使用说明
 
