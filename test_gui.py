@@ -195,6 +195,61 @@ def main():
 
     print("ink ratio %.3f" % ink(img))
 
+    # ---- 回归: 纯平移预览必须逐像素搬运 (不重采样、不糊) ----
+    app.pan = [0.0, 0.0]
+    app.zoom = 1.0
+    app._interactive = False
+    app._fast_preview = False
+    app._do_render()
+    root.update()
+    snap = app._last_img.copy()
+    W, H = snap.size
+    app.pan = [13.0, -9.0]
+    app._frame_scale = app._scale()
+    pv = app._preview_canvas(W, H)
+    app._frame_scale = None
+    Image2 = app._PIL()[0]
+    exp = Image2.new("RGBA", (W, H), gv.BG_RGB + (255,))
+    exp.paste(snap.crop((0, 9, W, H)), (13, 0))
+    check("pan preview is pixel shift", pv is not None
+          and pv.tobytes() == exp.tobytes())
+
+    # ---- 回归: 拖层快速合成 == 逐层全量合成 ----
+    app.pan = [0.0, 0.0]
+    app._interactive = False
+    app._fast_preview = False
+    app._do_render()
+    root.update()
+    ly = app.layers[0]
+    app.selected = 0
+    app._drag = {"mode": "layer", "px": 0.0, "py": 0.0, "ox": 0.0, "oy": 0.0}
+    app._drag_ly = ly
+    app._drag_bg = None
+    app._drag_above = None
+    app._drag_bg_key = None
+    ly.offset[0] += 0.4
+    ly.offset[1] -= 0.2
+    app._frame_scale = app._scale()
+    got = app._drag_canvas(W, H)
+    want = Image2.new("RGBA", (W, H), gv.BG_RGB + (255,))
+    for _l in app.layers:
+        if _l.visible and _l.base_img is not None:
+            app._composite_layer(want, _l, W, H)
+    app._frame_scale = None
+    from PIL import ImageChops
+    worst = max(ImageChops.difference(got, want).getextrema(),
+                key=lambda t: t[1])[1] if got is not None else 255
+    check("drag fast composite matches full",
+          got is not None and worst <= 1, "max channel diff=%r" % (worst,))
+    ly.offset = [0.0, 0.0]
+    app._drag = None
+    app._drag_ly = None
+    app._drag_bg = None
+    app._drag_above = None
+    app._drag_bg_key = None
+    app._do_render()
+    root.update()
+
     # ---- 网络高亮 ----
     ly = app.layers[0]
     ev = type("E", (), {})()

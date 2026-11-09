@@ -1,0 +1,68 @@
+name: build-and-test
+
+# 每次推送到 main / PR 都会跑:
+#   1) 语法检查 + 回归测试(解析器 + 真实 Tk 渲染)
+#   2) 打包目录版 + 单文件版
+#   3) 冒烟测试: 两个 exe 必须真的能"打开"(不是只看打包成功)
+# 全部通过 => GitHub 上显示绿色对勾。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows 构建 / 回归 / exe 冒烟
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.0,<7"
+          python -c "import PIL, PyInstaller, sys; print('python', sys.version); print('Pillow', PIL.__version__); print('PyInstaller', PyInstaller.__version__)"
+
+      - name: 语法检查
+        run: |
+          python -m compileall -q Evan_Gerber_View.py gerber_viewer.py gerber_reader.py gerber_layer.py gerber_native.py win_dpi.py branding.py test_gui.py
+
+      - name: 回归测试 (解析器 + Tk 渲染)
+        run: python test_gui.py
+
+      - name: 打包目录版 (dist/Evan_Gerber_View/Evan_Gerber_View.exe)
+        run: python -m PyInstaller --clean --noconfirm Evan_Gerber_View.spec
+
+      - name: 打包单文件版 (dist/Evan_Gerber_View.exe)
+        run: python -m PyInstaller --clean --noconfirm Evan_Gerber_View_onefile.spec
+
+      - name: 冒烟测试 — exe 必须真的能打开
+        shell: pwsh
+        run: |
+          ./tools/smoke_test_exe.ps1 -Exe 'dist\Evan_Gerber_View\Evan_Gerber_View.exe','dist\Evan_Gerber_View.exe'
+
+      - name: 上传产物 (目录版 + 单文件版)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Evan_Gerber_View-windows-x64
+          path: |
+            dist/Evan_Gerber_View.exe
+            dist/Evan_Gerber_View/**
+          if-no-files-found: error
+          retention-days: 30

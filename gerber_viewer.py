@@ -413,6 +413,10 @@ class GerberViewer:
         self.zoom = 1.0
         self.pan = [0.0, 0.0]
         self._drag = None
+        self._drag_ly = None               # 拖动中的图层 (只重合成这一层, 其余作背景缓存)
+        self._drag_bg = None               # 拖动背景缓存: 下方图层已经合成好
+        self._drag_above = None            # 上方图层的透明叠加缓存 (保持叠放顺序)
+        self._drag_bg_key = None           # 背景缓存对应的视口签名
         self._view_bbox = None
         self._pil = None
         self._photo = None                 # 保留引用防 GC
@@ -647,9 +651,13 @@ class GerberViewer:
             try:
                 kindjob = job[0]
                 if kindjob == "base":
-                    _, token, data, kind, lb, mirror, color, target = job
+                    _, ly, token, data, kind, lb, mirror, color, target = job
                     img, scale = self._render_layer_bitmap(
-                        data, kind, lb, mirror, color, target)
+                        data, kind, lb, mirror, color, target,
+                        should_abort=lambda ly=ly, token=token:
+                        ly.token != token or self._stop.is_set())
+                    if img is None:
+                        continue
                     self._ui_q.put(("base", token, img, scale, tuple(lb)))
                 elif kindjob == "detail":
                     _, _ly, token, data, kind, lb, mirror, color, target = job
@@ -659,8 +667,10 @@ class GerberViewer:
                     idx = self._layer_index(_ly)
                     img, scale = self._render_layer_bitmap(
                         data, kind, lb, mirror, color, target, clamp=False,
-                        index=idx)
-                    if _ly.detail_token != token:
+                        index=idx,
+                        should_abort=lambda ly=_ly, token=token:
+                        ly.detail_token != token or self._stop.is_set())
+                    if img is None or _ly.detail_token != token:
                         continue
                     self._ui_q.put(("detail", token, img, scale, tuple(lb)))
                 elif kindjob == "diff":
@@ -1580,6 +1590,10 @@ class GerberViewer:
         self._fast_preview = False          # 拖图层要看到层真的动, 不能用预览
         self._drag = {"mode": "layer", "px": event.x, "py": event.y}
         ly = self._sel_layer()
+        self._drag_ly = ly
+        self._drag_bg = None
+        self._drag_above = None
+        self._drag_bg_key = None
         if ly:
             self._drag["ox"], self._drag["oy"] = ly.offset
 
@@ -1605,6 +1619,10 @@ class GerberViewer:
     def _on_release(self, _event):
         if self._drag:
             self._drag = None
+            self._drag_ly = None
+            self._drag_bg = None
+            self._drag_above = None
+            self._drag_bg_key = None
             self._recompute_view_bbox()
             self._schedule_settle()
 
@@ -1726,7 +1744,7 @@ class GerberViewer:
                 return                      # 大图层交给 _request_detail 的局部高清块
         ly.token += 1
         ly.pending = True
-        self._render_q.put(("base", ly.token, ly.data, ly.kind, list(lb),
+        self._render_q.put(("base", ly, ly.token, ly.data, ly.kind, list(lb),
                             ly.mirror_x, ly.color, target))
 
     # ---------------- 纯渲染 (后台线程安全, 不触碰 Tk) ----------------
@@ -1788,11 +1806,12 @@ class GerberViewer:
                 for k in range(n + 1)]
 
     def _draw_prims(self, draw, data, kind, T, scale, fill, clear_fill,
-                    ap_cache=None, clip=None, indices=None):
+                    ap_cache=None, clip=None, indices=None, should_abort=None):
         """把一层图元画进 draw。
 
         clip=(x0,y0,x1,y1): 跳过完全在视口外的图元 (深放大时 95% 在屏幕外)
         indices: 只画这些图元序号 (空间索引给的候选), 传入时不再遍历全层
+        should_abort: 返回 True 时提前放弃 (视口已变/请求过期), 避免白算
         """
         store = data.get("primitives")
         if store is not None and getattr(store, "n", 0):
@@ -1803,6 +1822,8 @@ class GerberViewer:
             for i in rng:
                 cnt += 1
                 if not cnt & 1023:
+                    if should_abort is not None and should_abort():
+                        return False
                     time.sleep(0)          # 定期让出 GIL: 后台重渲时界面不僵
                 b = i * 9
                 code = int(rec[b])
@@ -1897,6 +1918,7 @@ class GerberViewer:
                     draw.line([cx, cy], [ex, ey], fill=fill, width=max(1, int(round(r * 2))))
                     draw.ellipse([ex - r, ey - r, ex + r, ey + r], fill=fill)
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill)
+        return True
 
     @staticmethod
     def _make_xform(bbox, scale, img_h, mirror, offset):
@@ -1909,11 +1931,13 @@ class GerberViewer:
         return T
 
     def _render_layer_bitmap(self, data, kind, lb, mirror, color, target_scale,
-                             clamp=True, index=None, indices=None):
+                             clamp=True, index=None, indices=None,
+                             should_abort=None):
         """渲染单层掩膜 (L 灰度): 255 = 该处有图形, 0 = 空白。
 
         抗锯齿: PIL 的 ImageDraw 是硬边, 位图不大时按 2x 超采样绘制再 LANCZOS 降采样,
         边缘才有过渡像素; 位图很大时降回 1x, 避免内存/耗时失控。
+        视口已变时通过 should_abort 提前退出, 返回 (None, scale)。
         """
         Image, ImageDraw, _ = self._PIL()
         minx, miny, maxx, maxy = lb
@@ -1934,8 +1958,11 @@ class GerberViewer:
         sel = indices
         if sel is None and index is not None:
             sel = index.query(lb[0], lb[1], lb[2], lb[3])
-        self._draw_prims(draw, data, kind, T, scale * ss, 255, 0,
-                         ap_cache={}, clip=clip, indices=sel)
+        ok = self._draw_prims(draw, data, kind, T, scale * ss, 255, 0,
+                              ap_cache={}, clip=clip, indices=sel,
+                              should_abort=should_abort)
+        if not ok:
+            return None, scale                 # 视口已变, 丢弃这次光栅化
         if ss > 1:
             img = img.resize((W, H), Image.LANCZOS)
         return img, scale
@@ -1968,6 +1995,8 @@ class GerberViewer:
         canvas_img = None
         if self._interactive and self._fast_preview:
             canvas_img = self._preview_canvas(W, H)
+        if canvas_img is None and self._drag_ly is not None and self._drag:
+            canvas_img = self._drag_canvas(W, H)
         if canvas_img is None:
             canvas_img = Image.new("RGBA", (W, H), BG_RGB + (255,))
             for ly in self.layers:
@@ -2027,6 +2056,24 @@ class GerberViewer:
         if img is None or not vw:
             return None
         Image = self._PIL()[0]
+        # 纯平移 (缩放没变): 上一帧和新帧的 px/mm 完全相同, 直接按整数像素
+        # 搬运上一帧, 不重采样 -> 平移时既清晰又便宜 (约 1~2ms/帧)。
+        W0, H0 = img.size
+        span = vw[2] - vw[0]
+        s_now = self._sc()[0]
+        if span > 1e-12 and s_now > 0:
+            s_old = W0 / span
+            if abs(s_now - s_old) <= 1e-9 * max(1.0, s_old):
+                X0, Y0 = self._to_canvas(vw[0], vw[3])
+                dx, dy = int(round(X0)), int(round(Y0))
+                if dx < W and dy < H and dx + W0 > 0 and dy + H0 > 0:
+                    sx0, sy0 = max(0, -dx), max(0, -dy)
+                    sx1, sy1 = min(W0, W - dx), min(H0, H - dy)
+                    if sx1 > sx0 and sy1 > sy0:
+                        canvas_img = Image.new("RGBA", (W, H), BG_RGB + (255,))
+                        canvas_img.paste(img.crop((sx0, sy0, sx1, sy1)),
+                                         (dx + sx0, dy + sy0))
+                        return canvas_img
         # 上一帧覆盖的世界矩形, 在当前视口里落在哪
         X0, Y0 = self._to_canvas(vw[0], vw[3])
         X1, Y1 = self._to_canvas(vw[2], vw[1])
@@ -2047,7 +2094,10 @@ class GerberViewer:
         dw = max(1, int(round((fx1 - fx0) * sw)))
         dh = max(1, int(round((fy1 - fy0) * sh)))
         if src.size != (dw, dh):
-            src = src.resize((dw, dh), Image.BILINEAR)
+            # 缩小用 BOX (抗锯齿且更快), 放大用 BILINEAR 保边缘
+            resample = (Image.BOX if dw < src.size[0] or dh < src.size[1]
+                        else Image.BILINEAR)
+            src = src.resize((dw, dh), resample)
         dx = int(round(X0 + fx0 * sw)); dy = int(round(Y0 + fy0 * sh))
         canvas_img = Image.new("RGBA", (W, H), BG_RGB + (255,))
         canvas_img.paste(src, (dx, dy))
@@ -2058,18 +2108,26 @@ class GerberViewer:
 
         color 可覆盖本层颜色 (网络高亮用)。
         """
-        if img is None or not bbox:
+        stamp = self._make_stamp(ly, img, bbox, W, H, color)
+        if stamp is None:
             return
+        rgb, mask, (cx0, cy0) = stamp
+        canvas_img.paste(rgb, (cx0, cy0), mask)
+
+    def _make_stamp(self, ly, img, bbox, W, H, color=None):
+        """把一层掩膜换算成屏幕上的 (颜色, 遮罩, 左上角), 供 paste / 透明度叠加复用"""
+        if img is None or not bbox:
+            return None
         ox, oy = ly.offset
         X0, Y0 = self._to_canvas(bbox[0] + ox, bbox[3] + oy)
         X1, Y1 = self._to_canvas(bbox[2] + ox, bbox[1] + oy)
         if X1 - X0 < 0.5 or Y1 - Y0 < 0.5:
-            return
+            return None
         cx0 = max(0, int(math.floor(X0))); cy0 = max(0, int(math.floor(Y0)))
         cx1 = min(W, int(math.ceil(X1)));  cy1 = min(H, int(math.ceil(Y1)))
         dw = cx1 - cx0; dh = cy1 - cy0
         if dw < 1 or dh < 1:
-            return
+            return None
         bw, bh = img.size
         bx0 = max(0, min(bw - 1, int((cx0 - X0) / (X1 - X0) * bw)))
         bx1 = max(bx0 + 1, min(bw, int((cx1 - X0) / (X1 - X0) * bw)))
@@ -2086,7 +2144,14 @@ class GerberViewer:
                 mask = mask.resize((dw, dh), Image.BOX)   # 缩小用 BOX, 不产生摩尔纹
         # 直接按颜色贴图: 源图尺寸再小也不会因为裁切越界而补出黑块
         rgb = color if isinstance(color, tuple) else _hex_rgb(color or ly.color)
-        canvas_img.paste(rgb, (cx0, cy0, cx1, cy1), mask)
+        return rgb, mask, (cx0, cy0)
+
+    def _layer_stamp(self, ly, W, H, color=None):
+        """按当前视口取该层可用的最高清缓存 (高清块优先), 转成屏幕图章"""
+        if self._detail_usable(ly):
+            return self._make_stamp(ly, ly.detail_img, ly.detail_bbox, W, H, color)
+        return self._make_stamp(ly, ly.base_img,
+                                ly.base_bbox or ly.local_bbox(), W, H, color)
 
     def _detail_usable(self, ly):
         """高清块是否与当前视口匹配 (比例一致且覆盖了视口与图层的交集)"""
@@ -2113,10 +2178,54 @@ class GerberViewer:
 
     def _composite_layer(self, canvas_img, ly, W, H):
         # 高清块有效时直接用它, 不再叠粗缓存 (被放大的粗图会把清晰边缘糊掉)
-        if self._detail_usable(ly):
-            self._blit(canvas_img, ly, ly.detail_img, ly.detail_bbox, W, H)
-        else:
-            self._blit(canvas_img, ly, ly.base_img, ly.base_bbox or ly.local_bbox(), W, H)
+        stamp = self._layer_stamp(ly, W, H)
+        if stamp is None:
+            return
+        rgb, mask, (cx0, cy0) = stamp
+        canvas_img.paste(rgb, (cx0, cy0), mask)
+
+    def _drag_canvas(self, W, H):
+        """拖动单个图层时的快速合成: 下层/上层各拼一次作缓存,
+        拖动期间每帧只重新合成被拖的那一层, 并保持原有的图层叠放顺序。"""
+        ly = self._drag_ly
+        if ly is None or not self._layer_on(ly) or ly.base_img is None:
+            return None
+        Image = self._PIL()[0]
+        key = (W, H, round(self.zoom, 9), round(self.pan[0], 2),
+               round(self.pan[1], 2),
+               tuple((id(l), l.visible, id(l.base_img), id(l.detail_img))
+                     for l in self.layers))
+        if self._drag_bg is None or self._drag_bg.size != (W, H) \
+                or self._drag_bg_key != key:
+            below = Image.new("RGBA", (W, H), BG_RGB + (255,))
+            above = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            has_above = False
+            passed = False
+            for other in self.layers:
+                if other is ly:
+                    passed = True
+                    continue
+                if not self._layer_on(other) or other.base_img is None:
+                    continue
+                if not passed:
+                    self._composite_layer(below, other, W, H)
+                    continue
+                stamp = self._layer_stamp(other, W, H)
+                if stamp is None:
+                    continue
+                rgb, mask, (cx0, cy0) = stamp
+                tile = Image.new("RGBA", mask.size, rgb + (255,))
+                tile.putalpha(mask)             # 只有图形本身不透明
+                above.alpha_composite(tile, (cx0, cy0))
+                has_above = True
+            self._drag_bg = below
+            self._drag_above = above if has_above else None
+            self._drag_bg_key = key
+        canvas_img = self._drag_bg.copy()
+        self._composite_layer(canvas_img, ly, W, H)
+        if self._drag_above is not None:
+            canvas_img.alpha_composite(self._drag_above)
+        return canvas_img
 
     def _draw_placeholder(self, canvas_img, ly):
         b = ly.bbox()

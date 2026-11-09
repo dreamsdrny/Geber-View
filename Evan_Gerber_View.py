@@ -8,6 +8,7 @@ Evan_Gerber_View: 程序入口 (独立 Gerber 查看器)
 """
 import sys                       # 提供 sys.path，用于修改模块搜索路径
 import os                        # 提供 os.path 系列函数，用于解析文件路径
+import time                      # 崩溃日志时间戳
 
 # ---------------------------------------------------------------------------
 # 把“当前脚本所在目录”插入到模块搜索路径的最前面（索引 0）。
@@ -79,6 +80,39 @@ def apply_icon(root) -> None:
     except Exception:  # noqa: BLE001
         pass                                   # 整个函数静默失败：图标只是锦上添花，
                                                # 绝不能因为它导致程序启动崩溃
+
+
+def _crash_log_paths():
+    """崩溃日志的候选路径: 先 exe 同级目录, 再用户目录(一定可写)"""
+    out = []
+    try:
+        out.append(os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)),
+            "Evan_Gerber_View_crash.log"))
+    except Exception:  # noqa: BLE001
+        pass
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    try:
+        folder = os.path.join(base, "Evan_Gerber_View")
+        os.makedirs(folder, exist_ok=True)
+        out.append(os.path.join(folder, "crash.log"))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _write_crash_log(text) -> str:
+    """把异常写进第一个可写的候选路径; 全失败也不抛异常(不能因此再崩一次)"""
+    for p in _crash_log_paths():
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("\n===== %s =====\n"
+                        % time.strftime("%Y-%m-%d %H:%M:%S"))
+                f.write(text if text.endswith("\n") else text + "\n")
+            return p
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
 
 
 def _selftest(files):
@@ -184,4 +218,11 @@ def main():
 if __name__ == "__main__":
     # 仅当作为脚本直接运行时执行 main()；
     # 被 import（如测试、打包入口调用）时不自动启动 GUI
-    main()
+    try:
+        main()
+    except Exception:              # noqa: BLE001
+        # 启动/运行期崩溃时留一份日志, 方便排查“双击打不开”;
+        # 记完再抛: PyInstaller 自带的报错框照常弹出, 用户依然看得到
+        import traceback
+        _write_crash_log(traceback.format_exc())
+        raise
