@@ -1,14 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Evan_Gerber_View: 独立 Gerber / NC Drill 查看器 打包配置
+import os
+
+# Rust 原生解析内核: 可选。源码在 rust/gerber_core, 编译产物 gerber_core.pyd
+# 被 .gitignore 忽略, 干净检出(例如 CI)里没有 —— 此时不打包它, 程序会自动回退
+# 到纯 Python 解析 (见 gerber_native.py 的 available())。
+_NATIVE_PYD = os.path.join('rust', 'gerber_core', 'gerber_core.pyd')
+if os.path.isfile(_NATIVE_PYD):
+    # 必须保持 .pyd 后缀, 否则 importlib 不会把它当扩展模块
+    _BINARIES = [(_NATIVE_PYD, '.')]
+else:
+    _BINARIES = []
+    print('WARNING: %s 不存在, 本次打包使用纯 Python 解析内核' % _NATIVE_PYD)
 
 a = Analysis(
     ['Evan_Gerber_View.py'],
     pathex=[],
-    binaries=[
-        # Rust 原生解析内核 (可选, 缺失时自动回退纯 Python)
-        # 必须是 .pyd 后缀, 否则 importlib 不会把它当扩展模块
-        ('rust/gerber_core/gerber_core.pyd', '.'),
-    ],
+    binaries=_BINARIES,
     datas=[
         ('Evan_Gerber_View.ico', '.'),
         ('Evan_Gerber_View.png', '.'),

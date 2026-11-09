@@ -50,6 +50,20 @@ jobs:
           PYTHONUTF8: '1'
         run: python test_gui.py
 
+      - name: 编译 Rust 原生内核 (可选加速; 失败则打包纯 Python 版本)
+        # gerber_core.pyd 是本地编译产物、不在 git 里, 干净检出时先编译出来再打包;
+        # 编译/自检失败时只丢弃产物, 不阻塞构建 (spec 会自动跳过它)
+        continue-on-error: true
+        shell: cmd
+        run: |
+          cd rust\gerber_core
+          cargo build --release --locked
+          if not exist target\release\gerber_core.dll exit /b 1
+          copy /Y target\release\gerber_core.dll gerber_core.pyd
+          cd ..\..
+          python -c "import gerber_native; ok, err = gerber_native.status(); print('native backend:', ok, err or '')"
+          if errorlevel 1 del rust\gerber_core\gerber_core.pyd
+
       - name: 打包目录版 (dist/Evan_Gerber_View/Evan_Gerber_View.exe)
         run: python -m PyInstaller --clean --noconfirm Evan_Gerber_View.spec
 
@@ -70,5 +84,6 @@ jobs:
           path: |
             dist/Evan_Gerber_View.exe
             dist/Evan_Gerber_View/**
+            启动单文件版.bat
           if-no-files-found: error
           retention-days: 30
