@@ -24,3 +24,16 @@ l1p
 l1pb
 l4p
 l8pt
+
+# Rust 原生内核: Cargo 构建产物与编译好的扩展都不入库
+# （干净检出时自动回退纯 Python；要加速就按 README 本地 cargo build）
+rust/gerber_core/target/
+rust/gerber_core/gerber_core.pyd
+*.rlib
+*.rmeta
+
+# 工具链/沙箱在当前目录留下的临时目录（低完整性进程写不进 %TEMP% 时会产生）
+.dsh-acl-recovery/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
