@@ -645,8 +645,9 @@ impl<'a> P<'a> {
                             2 => self.interp = 2,
                             3 => self.interp = 3,
                             36 => {
-                                self.in_region = true;
-                                self.region.clear();
+                                // Python handles curved region contours; never silently
+                                // replace them with straight chords in the native path.
+                                return false;
                             }
                             37 => self.close_region(),
                             74 => return false, // 单象限圆弧 (I/J 绝对值): 交给 Python

@@ -48,7 +48,9 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: '1'
-        run: python test_gui.py
+        run: |
+          python -B -m unittest -v test_accuracy
+          python -B test_gui.py
 
       - name: 编译 Rust 原生内核 (可选加速; 失败则打包纯 Python 版本)
         # gerber_core.pyd 是本地编译产物、不在 git 里, 干净检出时先编译出来再打包;
@@ -61,8 +63,16 @@ jobs:
           if not exist target\release\gerber_core.dll exit /b 1
           copy /Y target\release\gerber_core.dll gerber_core.pyd
           cd ..\..
-          python -c "import gerber_native; ok, err = gerber_native.status(); print('native backend:', ok, err or '')"
+          python -c "import gerber_native; ok = gerber_native.available(); print('native backend:', ok, gerber_native.status()[1] or ''); raise SystemExit(0 if ok else 1)"
           if errorlevel 1 del rust\gerber_core\gerber_core.pyd
+
+      - name: 原生内核回归
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: |
+          python -B -m unittest -v test_accuracy
+          python -B test_gui.py
 
       - name: 打包目录版 (dist/Evan_Gerber_View/Evan_Gerber_View.exe)
         run: python -m PyInstaller --clean --noconfirm Evan_Gerber_View.spec

@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 
 MIL_TO_MM = 0.0254
 INCH_TO_MM = 25.4
+MAX_INPUT_BYTES = 256 * 1024 * 1024
+MAX_EXPANDED_PRIMITIVES = 2_000_000
+MAX_MACRO_VERTICES = 10_000
+
+
+def _check_input_size(path):
+    if os.stat(path).st_size > MAX_INPUT_BYTES:
+        raise ValueError("文件超过 256 MiB 解析上限")
 
 # 板框轮廓层名识别 (Gerber/ODB 常见命名)
 _OUTLINE_RE = re.compile(
@@ -94,6 +102,14 @@ PRIM_STRIDE = 9                   # 每个图元占几个 double
 
 _PRIM_CODES = {"draw": PRIM_DRAW, "flash": PRIM_FLASH, "arc": PRIM_ARC,
                "region": PRIM_REGION, "error": PRIM_ERROR}
+
+
+def _contours(points):
+    if not points:
+        return []
+    if points[0] and isinstance(points[0][0], (tuple, list)):
+        return points
+    return [points]
 
 
 class PrimStore:
@@ -166,8 +182,10 @@ class PrimStore:
                 r[b + k] *= factor
         for k, (pts, net, ref, pin) in list(out.extras.items()):
             if pts:
-                out.extras[k] = ([(x * factor, y * factor) for x, y in pts],
-                                 net, ref, pin)
+                contours = _contours(pts)
+                scaled = [[(x * factor, y * factor) for x, y in c] for c in contours]
+                out.extras[k] = (scaled if len(contours) > 1 else scaled[0],
+                                  net, ref, pin)
         return out
 
 
@@ -476,6 +494,8 @@ def _rot_points_about(points, cx: float, cy: float, deg: float):
 
 def _regular_poly(cx, cy, dia, n, rot=0.0):
     n = max(3, int(n))
+    if n > MAX_MACRO_VERTICES:
+        raise ValueError("光圈宏顶点数量超过上限")
     r = dia / 2.0
     return [(cx + r * math.cos(math.radians(rot + k * 360.0 / n)),
              cy + r * math.sin(math.radians(rot + k * 360.0 / n))) for k in range(n)]
@@ -577,6 +597,8 @@ def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
                 poly(_rot_points_about(corners, cx, cy, rot), expo)
             elif code == 4:                                 # 轮廓多边形
                 expo = val(a[0]); cnt = int(val(a[1])) if len(a) > 1 else 0
+                if cnt > MAX_MACRO_VERTICES:
+                    raise ValueError("光圈宏顶点数量超过上限")
                 coords = a[2:]
                 rot = 0.0
                 need = cnt * 2
@@ -635,7 +657,7 @@ def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
                     corners = [(cx - gap / 2, cy - outer / 2), (cx + gap / 2, cy - outer / 2),
                                (cx + gap / 2, cy + outer / 2), (cx - gap / 2, cy + outer / 2)]
                     poly(_rot_points(corners, ang), 0)
-        except (IndexError, ValueError, TypeError):
+        except (IndexError, TypeError):
             continue
     return out
 
@@ -648,7 +670,9 @@ def _arc_sample(x1, y1, x2, y2, i, j, cw, seg: int = 24):
         return [(x1, y1), (x2, y2)]
     a1 = math.atan2(y1 - cy, x1 - cx)
     a2 = math.atan2(y2 - cy, x2 - cx)
-    if cw:
+    if math.isclose(x1, x2, abs_tol=1e-12) and math.isclose(y1, y2, abs_tol=1e-12):
+        a2 = a1 - 2 * math.pi if cw else a1 + 2 * math.pi
+    elif cw:
         while a2 > a1:
             a2 -= 2 * math.pi
     else:
@@ -656,6 +680,18 @@ def _arc_sample(x1, y1, x2, y2, i, j, cw, seg: int = 24):
             a2 += 2 * math.pi
     return [(cx + r * math.cos(a1 + (a2 - a1) * k / seg),
              cy + r * math.sin(a1 + (a2 - a1) * k / seg)) for k in range(seg + 1)]
+
+
+def _region_arc(x1, y1, x2, y2, i, j, cw):
+    """Flatten a region arc with a maximum 1 µm chord error."""
+    radius = math.hypot(i, j)
+    if radius <= 1e-12:
+        return [(x2, y2)]
+    angle = math.acos(max(-1.0, min(1.0, 1.0 - 0.001 / radius)))
+    seg = max(24, min(4096, int(math.ceil(math.pi / max(angle, 1e-9)))))
+    points = _arc_sample(x1, y1, x2, y2, i, j, cw, seg)
+    points[-1] = (x2, y2)
+    return points[1:]
 
 
 def _arc_center_sq(x1, y1, x2, y2, i_abs, j_abs, cw):
@@ -691,7 +727,9 @@ def _shift_prim(prim: dict, dx: float, dy: float) -> dict:
         if p.get(k) is not None:
             p[k] = p[k] + dy
     if p.get("points"):
-        p["points"] = [(x + dx, y + dy) for x, y in p["points"]]
+        contours = _contours(p["points"])
+        shifted = [[(x + dx, y + dy) for x, y in c] for c in contours]
+        p["points"] = shifted if len(contours) > 1 else shifted[0]
     return p
 
 
@@ -709,15 +747,15 @@ def _scale_aperture_params(ap: dict, factor: float, unit: str) -> list:
     f = (INCH_TO_MM if unit == "inch" else 1.0) * factor
     shape = str(ap.get("shape", "")).upper()
     if shape == "P":
-        idxs = (0,)
+        idxs = (0, 3)
     elif shape in ("R", "O"):
-        idxs = tuple(range(min(len(params), 2)))
+        idxs = tuple(range(min(len(params), 3)))
     elif shape == "C":
-        idxs = (0,)
+        idxs = (0, 1)
     else:
         idxs = tuple(range(len(params)))          # 宏光圈: 全部按长度缩放
     for i in idxs:
-        if isinstance(params[i], (int, float)) and not isinstance(params[i], bool):
+        if i < len(params) and isinstance(params[i], (int, float)) and not isinstance(params[i], bool):
             params[i] = params[i] * f
     return params
 
@@ -923,6 +961,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
       - 圆弧: G75 多象限 / G74 单象限 (I/J 绝对值需按走向定圆心符号)
       - 极性: %LPD/%LPC、X2 属性 %TF/%TA/%TO/%TD
     """
+    _check_input_size(path)
     # ---- 解析结果缓存 (同一文件重复查看时直接复用) ----
     key = None
     if unit_override is None and scale_override is None:
@@ -968,13 +1007,16 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
     cur_negative = False
     in_region = False
     region_pts: List[Tuple[float, float]] = []
+    region_contours: List[List[Tuple[float, float]]] = []
     cur_net = ""
     cur_pin = ""
     cur_refdes = ""
     macros: Dict[str, List[list]] = {}
     macro_missing: Set[str] = set()
     ap_vals: List[float] = []
+    unknown_commands: Set[str] = set()
     span = [None, None, None, None]         # 文件单位下的坐标范围
+    region_arc_seen = False
     sr: Optional[dict] = None               # 当前 %SR 拼版
     sr_buf: List[dict] = []
     # ---- 快速路径用的缓存量 (只在相关状态变化时更新) ----
@@ -1040,8 +1082,9 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
             res.add_point(prim.get("x1"), prim.get("y1"))
         if prim.get("x2") is not None:
             res.add_point(prim.get("x2"), prim.get("y2"))
-        for q in (prim.get("points") or []):
-            res.add_point(q[0], q[1])
+        for contour in _contours(prim.get("points")):
+            for q in contour:
+                res.add_point(q[0], q[1])
         if prim.get("type") == "arc":
             for q in _arc_sample(prim.get("x1") or 0.0, prim.get("y1") or 0.0,
                                  prim.get("x2") or 0.0, prim.get("y2") or 0.0,
@@ -1068,6 +1111,8 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         cnt_x = max(1, int(sr["x"]))
         cnt_y = max(1, int(sr["y"]))
         base = list(sr_buf)
+        if cnt_x * cnt_y > MAX_EXPANDED_PRIMITIVES or len(base) * cnt_x * cnt_y > MAX_EXPANDED_PRIMITIVES:
+            raise ValueError("拼版展开数量超过安全上限")
         for ix in range(cnt_x):
             for iy in range(cnt_y):
                 if ix == 0 and iy == 0:
@@ -1096,19 +1141,43 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         return w * unit_factor * ((img_scale[0] + img_scale[1]) / 2.0)
 
     def close_region():
-        nonlocal in_region, region_pts
+        nonlocal in_region, region_pts, region_contours
         in_region = False
-        pts = list(region_pts)
+        contours = region_contours + ([region_pts] if region_pts else [])
         region_pts = []
+        region_contours = []
+        pts = [p for contour in contours for p in contour]
         if len(pts) < 2:
             return
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         d = meta()
-        d.update({"type": "region", "points": pts,
+        points = contours if len(contours) > 1 else pts
+        d.update({"type": "region", "points": points,
                   "x1": min(xs), "y1": min(ys), "x2": max(xs), "y2": max(ys),
                   "width": None, "aperture": None, "clear": cur_negative})
         emit(d)
+
+    def region_move(op, x1, y1, x2, y2, iraw, jraw):
+        nonlocal region_pts, region_arc_seen
+        if op == 2:
+            if region_pts:
+                region_contours.append(region_pts)
+                region_pts = []
+            region_pts.append((x2, y2))
+        elif op == 1 and interp in (2, 3):
+            region_arc_seen = True
+            cw = interp == 2
+            if quadrant_multi:
+                im, jm = vec(iraw or 0.0, jraw or 0.0)
+            else:
+                va = vec(abs(iraw or 0.0), abs(jraw or 0.0))
+                im, jm = _arc_center_sq(x1, y1, x2, y2, abs(va[0]), abs(va[1]), cw) or vec(iraw or 0.0, jraw or 0.0)
+            if img_mirror[0] != img_mirror[1]:
+                cw = not cw
+            region_pts.extend(_region_arc(x1, y1, x2, y2, im, jm, cw))
+        elif op == 1:
+            region_pts.append((x2, y2))
 
     def do_flash(x_mm, y_mm, ap_code):
         if ap_code is None:
@@ -1250,7 +1319,9 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
                     xm, ym = pt(nx_raw, ny_raw)
                     cx_mm, cy_mm = pt(rx, ry)
                 if in_region:
-                    region_pts.append((xm, ym))
+                    region_move(op, cx_mm, cy_mm, xm, ym,
+                                _coord_value(s_i, int_digits, dec_digits, zero_mode),
+                                _coord_value(s_j, int_digits, dec_digits, zero_mode))
                     rx, ry = nx_raw, ny_raw
                     continue
                 if op == 1:
@@ -1448,7 +1519,10 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
             if up.startswith("AS"):
                 res.warnings.append("含 %AS 轴选择命令, 非常规输出, 建议重新导出")
                 continue
-            # %IP / %IN / %LN / %PJ / %AM 空体等: 忽略
+            if up.startswith("IPPOS"):
+                continue
+            if not up.startswith(("LN", "IN")):
+                unknown_commands.add("%" + up[:24])
             continue
 
         # ---------------- 普通功能命令 ----------------
@@ -1474,6 +1548,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
                 elif gi == 36:
                     in_region = True
                     region_pts = []
+                    region_contours = []
                 elif gi == 37:
                     close_region()
                 elif gi == 70:
@@ -1538,8 +1613,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         op = cur_op
 
         if in_region:
-            if op in (1, 2):
-                region_pts.append((nx, ny))
+            region_move(op, cx_mm, cy_mm, nx, ny, i_raw, j_raw)
             rx, ry = nx_raw, ny_raw
             continue
         if op == 3:
@@ -1574,6 +1648,10 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         res.warnings.append(f"含拼版复制 %SR (共 {res.sr_steps + 1} 份)")
     if macro_missing:
         res.warnings.append("引用了未定义的光圈宏: " + ",".join(sorted(macro_missing)))
+    if unknown_commands:
+        res.warnings.append("未支持或忽略的扩展命令: " + ", ".join(sorted(unknown_commands)[:20]))
+    if region_arc_seen:
+        res.warnings.append("区域圆弧已离散化（目标弦高 0.001mm，分段数最多 4096）")
     if res.file_polarity.upper().startswith("NEG"):
         res.warnings.append("文件为负极性(FilePolarity=Negative)")
 
@@ -1747,6 +1825,7 @@ def parse_excellon(path: str, plating: Optional[str] = None,
       - 槽孔: G85 / M15+G01 路由; 重复: R##; 模态坐标: 省略 X 或 Y 时沿用上一值
       - 孔性质: PLATED / NON_PLATED (按刀具), 或文件名 PTH/NPTH
     """
+    _check_input_size(path)
     key = None
     if unit_override is None and format_override is None and scale_override is None:
         base_key = _cache_key(path, None)

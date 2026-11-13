@@ -27,7 +27,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from gerber_reader import detect_file_kind, parse_gerber, parse_excellon
+from gerber_reader import _contours, detect_file_kind, parse_gerber, parse_excellon
 from branding import win_title
 
 # 文件对话框后缀: 覆盖常见 CAM/制程量测导出格式 (无需再选 "All files")
@@ -249,8 +249,9 @@ def _prim_bbox(rec, b, extras, i, ap_max):
         pts = e[0] if e else None
         if not pts:
             return None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
+        flat = [p for contour in _contours(pts) for p in contour]
+        xs = [p[0] for p in flat]
+        ys = [p[1] for p in flat]
         return (min(xs), min(ys), max(xs), max(ys))
     r = max(wd, 0.0) * 0.5 + 0.05
     return (min(x1, x2) - r, min(y1, y2) - r, max(x1, x2) + r, max(y1, y2) + r)
@@ -288,6 +289,8 @@ class GerberLayer:
         self.index = None               # 空间索引 (深放大/点选时按需建)
         self.index_sig = None
         self.net_map = None             # 网络名 -> 图元序号 (点选时按需建)
+        self._pad_data = None
+        self._pad = 0.0
 
     # ---------------- 比例校正 ----------------
     def apply_scale(self, factor, auto=False):
@@ -348,6 +351,7 @@ class GerberLayer:
         b = self.local_bbox()
         size = f"{b[2] - b[0]:.2f}×{b[3] - b[1]:.2f}mm" if b else "-"
         bits = [f"单位/格式: {self.unit_label()}", f"图幅: {size}"]
+        bits.append(f"偏移: {self.offset[0]:+.4f},{self.offset[1]:+.4f}mm" + (" 镜像" if self.mirror_x else ""))
         if d.get("software"):
             bits.append(f"来源软件: {d['software']}")
         if d.get("hole_count") is not None and self.kind == "drill":
@@ -373,6 +377,24 @@ class GerberLayer:
         if not b:
             return None
         minx, miny, maxx, maxy = b
+        # Parser bounds track centres, not the physical extents of apertures.
+        data = self.data or {}
+        if self._pad_data is not data:
+            pad = 0.0
+            for ap in (data.get("apertures") or {}).values():
+                params = ap.get("params") or []
+                shape = str(ap.get("shape") or "").upper()
+                dims = params[:2] if shape in ("R", "O") else params[:1] if shape in ("C", "P") else []
+                pad = max([pad] + [abs(v) * (25.4 if data.get("unit") == "inch" else 1.0) / 2
+                                   for v in dims if isinstance(v, (int, float))])
+            for hole in data.get("holes") or []:
+                pad = max(pad, (hole.get("diameter_mm") or 0.3) / 2)
+            store = data.get("primitives")
+            if store is not None:
+                pad = max(pad, max((abs(store.rec[i + 5]) / 2 for i in range(0, len(store.rec), 9)), default=0))
+            self._pad_data, self._pad = data, pad
+        pad = self._pad
+        minx -= pad; miny -= pad; maxx += pad; maxy += pad
         if self.mirror_x:
             minx, maxx = -maxx, -minx
         return [minx, miny, maxx, maxy]
@@ -422,9 +444,13 @@ class GerberViewer:
         self._photo = None                 # 保留引用防 GC
         self._img_item = None              # 画布上唯一的图像图元
         self.diff_points = []              # 自动差异定位结果
+        self.diff_result = None
         self._group_idx = {"A": 0, "B": 0}
         self._batch = 0                    # 待解析文件计数
         self._batch_fit = False
+        self._parse_generation = 0
+        self._parse_errors = []
+        self._diff_generation = 0
         self._render_job = None
         self._settle_job = None
         self._lru_clock = 0.0
@@ -443,6 +469,7 @@ class GerberViewer:
         self._cfg_job = None                # 窗口尺寸变化防抖定时器
 
         self._stop = threading.Event()
+        self._diff_cancel = threading.Event()
         self._parse_q = queue.Queue()
         self._render_q = queue.Queue()
         self._ui_q = queue.Queue()
@@ -531,6 +558,20 @@ class GerberViewer:
             value="左键拖动=移动图层；右键拖动=平移；滚轮=缩放；画布双击=高亮整条网络；Esc=清除")
         ttk.Label(bar, textvariable=self.info, foreground="#555").pack(side=tk.RIGHT)
 
+        tools = ttk.Frame(self.win, padding=(6, 2))
+        tools.pack(fill=tk.X)
+        ttk.Button(tools, text="保存工程", command=self._save_project).pack(side=tk.LEFT)
+        ttk.Button(tools, text="打开工程", command=self._open_project).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tools, text="取消导入", command=self._cancel_import).pack(side=tk.LEFT)
+        ttk.Button(tools, text="取消对比", command=self._cancel_diff).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tools, text="解析问题", command=self._show_diagnostics).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tools, text="制造报告", command=self._manufacturing_report).pack(side=tk.LEFT)
+        ttk.Button(tools, text="导出差异CSV", command=self._export_diff_csv).pack(side=tk.LEFT, padx=3)
+        self._snap_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tools, text="测距吸附焊盘/孔中心", variable=self._snap_var).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tools, text="B组中心对齐", command=self._align_group_b_to_a).pack(side=tk.LEFT)
+        ttk.Button(tools, text="B组原始坐标", command=self._reset_group_b).pack(side=tk.LEFT, padx=3)
+
         body = ttk.Frame(self.win)
         body.pack(fill=tk.BOTH, expand=True)
 
@@ -604,6 +645,7 @@ class GerberViewer:
 
     def _on_close(self):
         self._stop.set()
+        self._diff_cancel.set()
         try:
             self._parse_q.put(None)
             self._render_q.put(None)
@@ -619,9 +661,12 @@ class GerberViewer:
             job = self._parse_q.get()
             if job is None:
                 break
-            paths, group = job
-            for p in paths:
+            records, group, generation = job
+            for record in records:
+                p = record["path"]
                 if self._stop.is_set():
+                    break
+                if generation != self._parse_generation:
                     break
                 base = os.path.basename(p)
                 self._ui_q.put(("status", f"解析中: {base}"))
@@ -638,10 +683,10 @@ class GerberViewer:
                         data = parse_excellon(p)
                     else:
                         data = parse_gerber(p, layer_name=base)
-                    self._ui_q.put(("layer", data, p, group, len(paths)))
+                    self._ui_q.put(("layer", data, p, record.get("group", group), len(records), generation, record))
                 except Exception as exc:  # noqa: BLE001
-                    self._ui_q.put(("parse_err", base, str(exc)))
-            self._ui_q.put(("parse_done", len(paths), group))
+                    self._ui_q.put(("parse_err", base, str(exc), generation))
+            self._ui_q.put(("parse_done", len(records), group, generation))
 
     def _render_worker(self):
         while not self._stop.is_set():
@@ -658,7 +703,7 @@ class GerberViewer:
                         ly.token != token or self._stop.is_set())
                     if img is None:
                         continue
-                    self._ui_q.put(("base", token, img, scale, tuple(lb)))
+                    self._ui_q.put(("base", ly, token, img, scale, tuple(lb)))
                 elif kindjob == "detail":
                     _, _ly, token, data, kind, lb, mirror, color, target = job
                     # 期间又缩放过 -> 直接丢弃 (不清 pending: 那可能已经是新请求的)
@@ -672,11 +717,13 @@ class GerberViewer:
                         ly.detail_token != token or self._stop.is_set())
                     if img is None or _ly.detail_token != token:
                         continue
-                    self._ui_q.put(("detail", token, img, scale, tuple(lb)))
+                    self._ui_q.put(("detail", _ly, token, img, scale, tuple(lb)))
                 elif kindjob == "diff":
                     _, payload = job
                     res = self._compute_diff(payload)
-                    self._ui_q.put(("diff", res))
+                    self._ui_q.put(("diff", payload["generation"], res))
+            except InterruptedError:
+                continue
             except Exception as exc:  # noqa: BLE001
                 self._ui_q.put(("status", f"渲染/差异计算出错: {exc}"))
 
@@ -701,27 +748,41 @@ class GerberViewer:
         if t == "status":
             self.status.set(msg[1])
         elif t == "layer":
-            _, data, path, group, batch_size = msg
+            _, data, path, group, batch_size, generation, record = msg
+            if generation != self._parse_generation:
+                return
             # 批量导入时先不进 Treeview, 等 parse_done 一次性重建 (原来每层都重建整表)
-            self._add_layer_data(data, path, group, refresh=False,
-                                 batch_size=batch_size)
+            ly = self._add_layer_data(data, path, group, refresh=False,
+                                      batch_size=batch_size)
+            if record.get("restore"):
+                ly.name = record.get("name") or ly.name
+                ly.color = record.get("color") or ly.color
+                ly.visible = bool(record.get("visible", True))
+                ly.offset = list(record["offset"])
+                ly.mirror_x = bool(record.get("mirror_x", False))
+                if abs(record["scale"] - 1.0) > 1e-9:
+                    ly.apply_scale(record["scale"])
+                self._invalidate(ly)
         elif t == "parse_err":
+            if msg[3] != self._parse_generation:
+                return
+            self._parse_errors.append((msg[1], msg[2]))
             self.status.set(f"解析失败: {msg[1]} — {msg[2]}")
         elif t == "parse_done":
-            _, _n, group = msg
+            _, _n, group, generation = msg
+            if generation != self._parse_generation:
+                return
             self._batch = max(0, self._batch - _n)
             if self._batch == 0:
                 self._promote_bottom_copper()                    # 铜层最高层号 -> 底层
                 self._refresh_list()                            # 全部解析完成后只重建一次
-                notes = self._auto_check_scales(True, True)      # 单位/格式差异自动校正
-                if group in ("A", "B") and any(l.group == "A" for l in self.layers) \
-                        and any(l.group == "B" for l in self.layers):
-                    self._align_group_b_to_a()
+                notes = self._auto_check_scales(False, True)     # 只提示，保留原始坐标
                 if self._batch_fit:
                     self.fit()
                 hidden = sum(1 for l in self.layers if not l.visible)
                 self.status.set(
                     f"已导入 {len(self.layers)} 层"
+                    + (f"，{len(self._parse_errors)} 个文件失败" if self._parse_errors else "")
                     + (f"，自动隐藏 {hidden} 个次要层" if hidden else "")
                     + " — 点『开/关』列切换 (滚轮缩放/右键平移)")
                 if notes:
@@ -729,32 +790,36 @@ class GerberViewer:
                 elif hidden:
                     self.info.set("已自动隐藏内层铜/钢网/盲埋孔; 点『全开』可全部显示")
         elif t == "base":
-            _, token, img, scale, lb = msg
-            for ly in self.layers:
-                if ly.token == token and ly.pending:
-                    ly.base_img = img
-                    ly.base_scale = scale
-                    ly.base_bbox = list(lb)
-                    ly.pending = False
-                    self._lru_clock += 1
-                    ly.lru = self._lru_clock
-                    break
+            _, ly, token, img, scale, lb = msg
+            if ly in self.layers and ly.token == token and ly.pending:
+                ly.base_img = img
+                ly.base_scale = scale
+                ly.base_bbox = list(lb)
+                ly.pending = False
+                self._lru_clock += 1
+                ly.lru = self._lru_clock
             self._schedule_render()
         elif t == "detail":
-            _, token, img, scale, lb = msg
-            for ly in self.layers:
-                if ly.detail_token == token and ly.detail_pending:
-                    ly.detail_img = img
-                    ly.detail_scale = scale
-                    ly.detail_bbox = list(lb)
-                    ly.detail_pending = False
-                    break
+            _, ly, token, img, scale, lb = msg
+            if ly in self.layers and ly.detail_token == token and ly.detail_pending:
+                ly.detail_img = img
+                ly.detail_scale = scale
+                ly.detail_bbox = list(lb)
+                ly.detail_pending = False
             self._schedule_render()
         elif t == "diff":
-            self._show_diff(msg[1])
+            if msg[1] == self._diff_generation:
+                self._show_diff(msg[2])
 
     # ---------------- 图层管理 ----------------
     def _color_for(self, data, group):
+        try:
+            from gerber_layer import identify_layer
+            role = identify_layer(data)
+        except Exception:  # noqa: BLE001
+            role = {"kind": "drill" if data.get("kind") == "drill" else "other",
+                    "side": "", "index": None}
+        data["_role"] = role
         if group == "A":
             c = _WARM[self._group_idx["A"] % len(_WARM)]
             self._group_idx["A"] += 1
@@ -763,13 +828,6 @@ class GerberViewer:
             c = _COOL[self._group_idx["B"] % len(_COOL)]
             self._group_idx["B"] += 1
             return c
-        try:
-            from gerber_layer import identify_layer
-            role = identify_layer(data)
-        except Exception:  # noqa: BLE001
-            role = {"kind": "drill" if data.get("kind") == "drill" else "other",
-                    "side": "", "index": None}
-        data["_role"] = role
         k = role.get("kind"); side = role.get("side") or ""
         if k == "copper" and side == "inner":
             idx = role.get("index")
@@ -793,6 +851,9 @@ class GerberViewer:
         ly.role = data.get("_role") or ly.role
         if data.get("kind") == "drill":
             ly.kind = "drill"
+            if ly.role.get("kind") != "drill":
+                ly.role = dict(ly.role, kind="drill", side="")
+                data["_role"] = ly.role
         # 批量导入整目录时, 默认隐藏次要层 (内层铜/钢网/盲埋孔), 避免 19 层全叠在一起;
         # 单层或少量文件仍全部显示, 用户可随时点『全开』。
         # 用本次导入的文件数判断, 避免小导入排在大的导入任务后面时被误隐藏。
@@ -812,6 +873,7 @@ class GerberViewer:
             self._schedule_render()
         if ly.visible:
             self._request_base(ly)
+        return ly
 
     def _promote_bottom_copper(self):
         """铜层命名只给了层号时: 最高层号(如 l8p / l4p)按底层显示并着色。
@@ -879,7 +941,7 @@ class GerberViewer:
             return
         self._batch += len(paths)
         self._batch_fit = do_fit
-        self._parse_q.put((paths, group))
+        self._parse_q.put(([{"path": p} for p in paths], group, self._parse_generation))
 
     def _import_gerber(self):
         paths = filedialog.askopenfilenames(
@@ -1008,10 +1070,15 @@ class GerberViewer:
         self._last_img = None
 
     def _clear(self):
+        self._parse_generation += 1
+        self._parse_errors = []
+        self._diff_generation += 1
+        self._diff_cancel.set()
         self._drop_layer_refs()
         self.layers = []
         self.selected = None
         self.diff_points = []
+        self.diff_result = None
         self._group_idx = {"A": 0, "B": 0}
         self._batch = 0
         self._measure_pts = []
@@ -1019,6 +1086,97 @@ class GerberViewer:
         self._recompute_view_bbox()
         self._refresh_list()
         self._schedule_render()
+
+    def _cancel_import(self):
+        self._parse_generation += 1
+        self._batch = 0
+        self._refresh_list()
+        self.status.set("已取消待导入文件；当前文件解析结束后停止")
+
+    def _cancel_diff(self):
+        self._diff_generation += 1
+        self._diff_cancel.set()
+        self.status.set("正在取消对比")
+
+    def _reset_group_b(self):
+        for layer in self.layers:
+            if layer.group == "B":
+                layer.offset = [0.0, 0.0]
+        self._recompute_view_bbox()
+        self._schedule_render()
+        self.status.set("B组已恢复原始坐标偏移")
+
+    def _save_project(self):
+        from gerber_project import save
+        path = filedialog.asksaveasfilename(title="保存工程", defaultextension=".egv.json",
+                                            filetypes=[("Gerber 工程", "*.egv.json")])
+        if path:
+            try:
+                save(path, self.layers)
+                self.status.set("工程已保存: " + path)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("保存工程失败", str(exc), parent=self.win)
+
+    def _open_project(self):
+        from gerber_project import load
+        path = filedialog.askopenfilename(title="打开工程", filetypes=[("Gerber 工程", "*.egv.json"), ("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            records = load(path)
+        except (OSError, ValueError, TypeError) as exc:
+            messagebox.showerror("打开工程失败", str(exc), parent=self.win)
+            return
+        self._clear()
+        self._batch = len(records)
+        self._batch_fit = True
+        for record in records:
+            record["restore"] = True
+        if records:
+            self._parse_q.put((records, "", self._parse_generation))
+
+    def _show_diagnostics(self):
+        lines = [f"导入失败: {name} — {error}" for name, error in self._parse_errors]
+        for layer in self.layers:
+            lines.append(f"{layer.name}: 比例 ×{layer.scale_factor:g}, 偏移 {layer.offset}, 镜像 {layer.mirror_x}")
+            lines.extend("  " + str(w) for w in (layer.data.get("warnings") or []))
+        messagebox.showinfo("解析与变换信息", "\n".join(lines) if lines else "暂无问题", parent=self.win)
+
+    def _manufacturing_report(self):
+        from gerber_report import manufacturing
+        report = manufacturing(self.layers)
+        win = tk.Toplevel(self.win)
+        win.title(win_title("制造数据报告"))
+        win.geometry("760x600")
+        text = tk.Text(win, wrap="word")
+        text.pack(fill=tk.BOTH, expand=True)
+        text.insert("1.0", report)
+        text.config(state="disabled")
+
+        def export():
+            path = filedialog.asksaveasfilename(parent=win, defaultextension=".txt",
+                                                filetypes=[("文本报告", "*.txt")])
+            if path:
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(report)
+                except OSError as exc:
+                    messagebox.showerror("报告导出失败", str(exc), parent=win)
+        ttk.Button(win, text="导出文本", command=export).pack(pady=4)
+
+    def _export_diff_csv(self):
+        from gerber_report import write_diff_csv
+        if not self.diff_result:
+            messagebox.showinfo("导出差异", "请先计算 A/B 差异", parent=self.win)
+            return
+        path = filedialog.asksaveasfilename(parent=self.win, defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv")])
+        if path:
+            try:
+                write_diff_csv(path, self.diff_result)
+                self.status.set("差异报告已导出: " + path)
+            except OSError as exc:
+                messagebox.showerror("报告导出失败", str(exc), parent=self.win)
 
     def _refresh_list(self):
         self.tree.delete(*self.tree.get_children())
@@ -1290,6 +1448,9 @@ class GerberViewer:
         for l in B:
             l.offset = [dx, dy]
         self._recompute_view_bbox()
+        self._last_img = None
+        self._schedule_render()
+        self.status.set(f"B组已中心对齐，偏移 ({dx:.4f}, {dy:.4f}) mm")
 
     # ---------------- 比例校正 (不同 CAM 导出的单位/格式差异) ----------------
     def _layer_span(self, ly):
@@ -1794,7 +1955,9 @@ class GerberViewer:
             seg = self._arc_segs(r * (scale or 1.0))
         a1 = math.atan2(y1 - cy, x1 - cx)
         a2 = math.atan2(y2 - cy, x2 - cx)
-        if cw:
+        if math.isclose(x1, x2, abs_tol=1e-12) and math.isclose(y1, y2, abs_tol=1e-12):
+            a2 = a1 - 2 * math.pi if cw else a1 + 2 * math.pi
+        elif cw:
             while a2 > a1:
                 a2 -= 2 * math.pi
         else:
@@ -1851,6 +2014,20 @@ class GerberViewer:
                         if (cx + m < clip[0] or cx - m > clip[2]
                                 or cy + m < clip[1] or cy - m > clip[3]):
                             continue
+                    aperture = (data.get("apertures") or {}).get(ap) or {}
+                    params = aperture.get("params") or []
+                    hole_index = {"C": 1, "R": 2, "O": 2, "P": 3}.get(shape)
+                    hole = params[hole_index] if hole_index is not None and len(params) > hole_index else 0
+                    before = None
+                    if isinstance(hole, (int, float)) and hole > 0:
+                        radius = hole * (25.4 if data.get("unit") == "inch" else 1.0) * scale / 2
+                        image = draw._image
+                        left = max(0, int(math.floor(cx - radius - 1)))
+                        top = max(0, int(math.floor(cy - radius - 1)))
+                        right = min(image.width, int(math.ceil(cx + radius + 2)))
+                        bottom = min(image.height, int(math.ceil(cy + radius + 2)))
+                        if right > left and bottom > top:
+                            before = image.crop((left, top, right, bottom))
                     if shape == "R":
                         hw, hh = fw / 2 * scale, fh / 2 * scale
                         draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh], fill=c)
@@ -1874,6 +2051,12 @@ class GerberViewer:
                     else:
                         r = max(0.6, fw / 2 * scale)
                         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=c)
+                    if before is not None:
+                        Image, ImageDraw, _ = self._PIL()
+                        mask = Image.new("L", before.size, 0)
+                        ImageDraw.Draw(mask).ellipse((cx - radius - left, cy - radius - top,
+                                                      cx + radius - left, cy + radius - top), fill=255)
+                        image.paste(before, (left, top), mask)
                 elif t == 2:                               # arc
                     pts = [T(px, py) for px, py in self._arc_points(
                         x1, y1, x2, y2, rec[b + 7], rec[b + 8],
@@ -1887,11 +2070,30 @@ class GerberViewer:
                     e = extras.get(i)
                     pl = e[0] if e else None
                     if pl:
-                        pts = [T(px, py) for px, py in pl]
-                        if len(pts) >= 3:
-                            if clip is not None and _outside(pts, clip, 1):
+                        contours = [[T(px, py) for px, py in contour]
+                                    for contour in _contours(pl)]
+                        if len(contours) == 1:
+                            pts = contours[0]
+                            if len(pts) >= 3 and (clip is None or not _outside(pts, clip, 1)):
+                                draw.polygon(pts, fill=c)
+                        else:
+                            Image, ImageDraw, _ = self._PIL()
+                            from PIL import ImageChops
+                            flat = [p for contour in contours for p in contour]
+                            left = max(0, int(math.floor(min(p[0] for p in flat))) - 1)
+                            top = max(0, int(math.floor(min(p[1] for p in flat))) - 1)
+                            right = min(draw._image.width, int(math.ceil(max(p[0] for p in flat))) + 2)
+                            bottom = min(draw._image.height, int(math.ceil(max(p[1] for p in flat))) + 2)
+                            if right <= left or bottom <= top:
                                 continue
-                            draw.polygon(pts, fill=c)
+                            mask = Image.new("1", (right - left, bottom - top), 0)
+                            for pts in contours:
+                                if len(pts) < 3 or (clip is not None and _outside(pts, clip, 1)):
+                                    continue
+                                one = Image.new("1", mask.size, 0)
+                                ImageDraw.Draw(one).polygon([(x - left, y - top) for x, y in pts], fill=1)
+                                mask = ImageChops.logical_xor(mask, one)
+                            draw._image.paste(c, (left, top, right, bottom), mask.convert("L"))
                 else:                                      # draw
                     wpx = max(1, int(round(wd * scale)))
                     a = T(x1, y1)
@@ -1915,7 +2117,7 @@ class GerberViewer:
                     continue
                 if hd.get("is_slot") and hd.get("x2") is not None and hd.get("y2") is not None:
                     ex, ey = T(hd["x2"], hd["y2"])
-                    draw.line([cx, cy], [ex, ey], fill=fill, width=max(1, int(round(r * 2))))
+                    draw.line([(cx, cy), (ex, ey)], fill=fill, width=max(1, int(round(r * 2))))
                     draw.ellipse([ex - r, ey - r, ex + r, ey + r], fill=fill)
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill)
         return True
@@ -2385,9 +2587,51 @@ class GerberViewer:
     def _measure_click(self, event):
         if len(self._measure_pts) >= 3:
             self._measure_pts = []
-        self._measure_pts.append(self._canvas_to_mm(event.x, event.y))
+        x, y = self._canvas_to_mm(event.x, event.y)
+        self._last_snap_info = ""
+        if self._snap_var.get():
+            x, y = self._snap_point(x, y)
+        if getattr(self, "_last_snap_info", ""):
+            self.status.set(self._last_snap_info)
+        self._measure_pts.append((x, y))
         self._measure_cur = None
         self._refresh_measure()
+
+    def _snap_point(self, x, y):
+        """Snap to nearby flash/drill centres; preserve world coordinates."""
+        tol = 8.0 / max(self._sc()[0], 1e-9)
+        best, dist = (x, y), tol
+        self._last_snap_info = ""
+        for ly in self.layers:
+            if not self._layer_on(ly):
+                continue
+            ox, oy = ly.offset
+            lx = x - ox
+            if ly.mirror_x:
+                lx = -lx
+            ly_y = y - oy
+            store = (ly.data or {}).get("primitives")
+            if store is not None:
+                idx = self._layer_index(ly)
+                candidates = idx.query(lx - tol, ly_y - tol, lx + tol, ly_y + tol) if idx else None
+                for i in (range(store.n) if candidates is None else candidates):
+                    b = i * 9
+                    if int(store.rec[b]) & 7 != 1:
+                        continue
+                    px, py = store.rec[b + 1], store.rec[b + 2]
+                    d = math.hypot(px - lx, py - ly_y)
+                    if d < dist:
+                        dist, best = d, ((-px if ly.mirror_x else px) + ox, py + oy)
+                        shape, fw, fh, _, _ = self._ap_shape_data(ly.data, int(store.rec[b + 6]), store.rec[b + 5])
+                        self._last_snap_info = f"{ly.name}: 焊盘中心，{shape} {fw:.4f}×{fh:.4f} mm"
+            for hole in (ly.data or {}).get("holes") or []:
+                if hole.get("x") is None or hole.get("y") is None:
+                    continue
+                d = math.hypot(hole["x"] - lx, hole["y"] - ly_y)
+                if d < dist:
+                    dist, best = d, ((-hole["x"] if ly.mirror_x else hole["x"]) + ox, hole["y"] + oy)
+                    self._last_snap_info = f"{ly.name}: 孔中心，孔径 {hole.get('diameter_mm') or '未知'} mm"
+        return best
 
     def _refresh_measure(self):
         """用 Tk 画布对象画测距线和读数 (避免每次鼠标移动都重绘整幅位图)"""
@@ -2459,6 +2703,8 @@ class GerberViewer:
 
     # ---------------- 自动差异定位 ----------------
     def _auto_diff(self):
+        from tkinter import simpledialog
+        from gerber_diff import pair_layers
         A = [l for l in self.layers if l.group == "A" and l.visible and l.local_bbox()]
         B = [l for l in self.layers if l.group == "B" and l.visible and l.local_bbox()]
         if not A or not B:
@@ -2467,19 +2713,62 @@ class GerberViewer:
                 "请先用『对比A: 导入多层』『对比B: 导入多层』分别载入 A、B 两组图层。\n"
                 "普通导入的图层不参与 A/B 对比。")
             return
+        # Layer data and transforms must remain stable while a background
+        # comparison is running, even if the user adjusts the view meanwhile.
+        def snapshot(layer):
+            copy = GerberLayer(layer.name, layer.data, layer.color, layer.group)
+            copy.offset = list(layer.offset)
+            copy.mirror_x = layer.mirror_x
+            copy.role = dict(layer.role or {})
+            return copy
+        A = [snapshot(layer) for layer in A]
+        B = [snapshot(layer) for layer in B]
         boxes = [l.bbox() for l in (A + B)]
         bbox = (min(b[0] for b in boxes), min(b[1] for b in boxes),
                 max(b[2] for b in boxes), max(b[3] for b in boxes))
-        w = max(bbox[2] - bbox[0], 1e-6); h = max(bbox[3] - bbox[1], 1e-6)
-        scale = min(DIFF_PX / max(w, h), 200.0)
-        specA = [(l.data, l.kind, l.mirror_x, tuple(l.offset)) for l in A]
-        specB = [(l.data, l.kind, l.mirror_x, tuple(l.offset)) for l in B]
-        payload = {"bbox": bbox, "scale": scale, "A": specA, "B": specB,
+        resolution = simpledialog.askfloat("逐层对比精度", "每像素毫米数 (越小越精细):",
+                                           initialvalue=0.05, minvalue=0.001, parent=self.win)
+        if resolution is None:
+            return
+        tolerance = simpledialog.askfloat("对比容差", "忽略边缘偏差 (mm，0 表示逐像素):",
+                                          initialvalue=0.0, minvalue=0.0, parent=self.win)
+        if tolerance is None:
+            return
+        pairs, notes = pair_layers(A, B)
+        self._diff_cancel.set()
+        self._diff_generation += 1
+        self._diff_cancel.clear()
+        payload = {"bbox": bbox, "resolution": resolution, "tolerance": tolerance,
+                   "pairs": pairs, "notes": notes, "generation": self._diff_generation,
                    "namesA": [l.name for l in A], "namesB": [l.name for l in B]}
         self.status.set("正在计算 A/B 差异 ...")
         self._render_q.put(("diff", payload))
 
     def _compute_diff(self, payload):
+        from gerber_diff import compare
+        Image, _, _ = self._PIL()
+
+        def render(layer, box, scale):
+            w = max(1, int(round((box[2] - box[0]) * scale)))
+            h = max(1, int(round((box[3] - box[1]) * scale)))
+            if layer is None:
+                return Image.new("L", (w, h), 0)
+            img, _ = self._render_mask([(layer.data, layer.kind, layer.mirror_x,
+                                         tuple(layer.offset))], box, scale)
+            return img.crop((0, 0, w, h))
+
+        points = compare(payload["pairs"], payload["bbox"], payload["resolution"],
+                         payload["tolerance"], render,
+                         lambda: self._stop.is_set() or self._diff_cancel.is_set()
+                         or payload.get("generation", self._diff_generation) != self._diff_generation)
+        na = sum(p["side"] == "A" for p in points)
+        nb = len(points) - na
+        return {"points": points, "total": len(points), "na": na, "nb": nb,
+                "namesA": payload["namesA"], "namesB": payload["namesB"],
+                "cell_mm": (payload["resolution"], payload["resolution"]),
+                "tolerance": payload["tolerance"], "notes": payload["notes"]}
+
+    def _compute_diff_legacy(self, payload):
         Image, _, _ = self._PIL()
         bbox = payload["bbox"]; scale = payload["scale"]
         mA, size = self._render_mask(payload["A"], bbox, scale)
@@ -2554,14 +2843,15 @@ class GerberViewer:
                 "cell_mm": (round(cw, 4), round(chh, 4))}
 
     def _show_diff(self, res):
-        self.diff_points = res["points"]
+        self.diff_result = res
+        self.diff_points = res["points"][:MAX_MARKERS]
         self._schedule_render()
         na, nb, total = res["na"], res["nb"], res["total"]
         cw, chh = res["cell_mm"]
         self.status.set(f"差异定位完成: {total} 处 (A多 {na} / B多 {nb})  网格 {cw}×{chh}mm  "
                         f"[A层 {len(res['namesA'])} vs B层 {len(res['namesB'])}]")
         if total == 0:
-            messagebox.showinfo("自动定位差异", "未发现明显差异 (A/B 在容差内一致)。")
+            messagebox.showinfo("自动定位差异", f"指定精度下未发现差异；像素 {cw:g} mm，容差 {res['tolerance']:g} mm。\n" + "\n".join(res["notes"]))
             return
         self._open_diff_window(res)
 
@@ -2577,11 +2867,11 @@ class GerberViewer:
                   font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
         ttk.Button(head, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
 
-        cols = ("i", "side", "x", "y", "area", "cells")
+        cols = ("i", "layer", "side", "x", "y", "area", "cells")
         tree = ttk.Treeview(win, columns=cols, show="headings", height=20)
-        heads = {"i": "#", "side": "差异侧", "x": "X(mm)", "y": "Y(mm)",
+        heads = {"i": "#", "layer": "配对图层", "side": "差异侧", "x": "X(mm)", "y": "Y(mm)",
                  "area": "差异面积mm²", "cells": "网格数"}
-        widths = {"i": 50, "side": 76, "x": 104, "y": 104, "area": 130, "cells": 80}
+        widths = {"i": 50, "layer": 250, "side": 76, "x": 104, "y": 104, "area": 130, "cells": 80}
         for c in cols:
             tree.heading(c, text=heads[c])
             tree.column(c, width=widths[c], anchor=tk.CENTER)
@@ -2593,7 +2883,7 @@ class GerberViewer:
         vsb.pack(side=tk.LEFT, fill=tk.Y, pady=6)
         for i, dp in enumerate(res["points"], 1):
             tree.insert("", tk.END, iid=str(i - 1), values=(
-                i, "A 多" if dp["side"] == "A" else "B 多",
+                i, dp.get("layer", ""), "A 多" if dp["side"] == "A" else "B 多",
                 f"{dp['x']:.3f}", f"{dp['y']:.3f}",
                 dp["area"], dp["cells"]), tags=(dp["side"],))
 
@@ -2609,6 +2899,9 @@ class GerberViewer:
         foot = ttk.Frame(win, padding=6)
         foot.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Button(foot, text="定位选中(双击亦可)", command=focus).pack(side=tk.LEFT)
+        ttk.Button(foot, text="导出 CSV", command=self._export_diff_csv).pack(side=tk.LEFT, padx=4)
+        if res.get("notes"):
+            ttk.Label(foot, text="；".join(res["notes"]), foreground="#a06000").pack(side=tk.LEFT)
         ttk.Label(foot, text="提示: 双击任一行可在版图中放大定位到该差异位置",
                   foreground="#555").pack(side=tk.LEFT, padx=8)
 
@@ -2643,8 +2936,9 @@ class GerberViewer:
         img = Image.new("RGBA", (ow, oh), BG_RGB + (255,))
         draw = ImageDraw.Draw(img)
         for ly in vis:
-            T = self._make_xform(bbox, scale, oh, ly.mirror_x, tuple(ly.offset))
-            self._draw_prims(draw, ly.data, ly.kind, T, scale,
-                             _hex_rgb(ly.color) + (235,), BG_RGB + (255,))
+            # Clear-polarity operations affect only this layer, not layers below.
+            mask, _ = self._render_mask([(ly.data, ly.kind, ly.mirror_x,
+                                          tuple(ly.offset))], bbox, scale)
+            img.paste(_hex_rgb(ly.color) + (255,), (0, 0), mask.crop((0, 0, ow, oh)))
         img.convert("RGB").save(path)
         messagebox.showinfo("导出完成", path)

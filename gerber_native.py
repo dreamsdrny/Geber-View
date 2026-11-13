@@ -8,6 +8,7 @@ Rust 只处理它能确定性复刻的子集
 这里也返回 None, 上层 parse_gerber 自动回退到纯 Python 实现。
 """
 import os
+import re
 import sys
 
 _MOD = None
@@ -69,6 +70,18 @@ def parse(path, layer_name=None):
     try:
         with open(path, "rb") as f:
             raw = f.read()
+        # Older bundled builds also need the corrected Python region parser.
+        if re.search(rb"G0*36(?:\D|$)", raw, re.IGNORECASE):
+            _LAST = "region handled by Python"
+            return None
+        # Unknown extension blocks need Python's explicit diagnostics.
+        known = (b"FS", b"MO", b"AD", b"LP", b"TF", b"TA", b"TO", b"TD",
+                 b"OF", b"SF", b"MI", b"IR", b"LN", b"IN", b"IPPOS")
+        for block in re.findall(rb"%([^%]*)%", raw):
+            if any(s.strip() and not s.strip().upper().startswith(known)
+                   for s in block.split(b"*")):
+                _LAST = "extension handled by Python"
+                return None
         r = _MOD.parse(raw)
     except Exception as exc:                   # noqa: BLE001
         _LAST = "%s: %s" % (type(exc).__name__, exc)
