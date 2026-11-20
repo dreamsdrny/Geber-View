@@ -29,6 +29,10 @@ l8pt
 # （干净检出时自动回退纯 Python；要加速就按 README 本地 cargo build）
 rust/gerber_core/target/
 rust/gerber_core/gerber_core.pyd
+rust/viewer_core/target/
+qt-viewer/build/
+qt-viewer/build-*/
+.tools/
 *.rlib
 *.rmeta
 
@@ -37,3 +41,7 @@ rust/gerber_core/gerber_core.pyd
 pip-build-tracker-*/
 pip-ephem-wheel-cache-*/
 pip-install-*/
+
+# 本地工具/调试日志
+aqtinstall.log
+debug.log

@@ -7,7 +7,7 @@ import math
 import os
 from collections import defaultdict
 
-from PIL import ImageChops
+from PIL import Image, ImageChops
 
 
 TILE_SIZE = 512
@@ -24,7 +24,9 @@ def _dilate_mm(image, resolution, tolerance):
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             if (dx or dy) and math.hypot(dx, dy) * resolution <= tolerance + 1e-12:
-                result = ImageChops.lighter(result, ImageChops.offset(image, dx, dy))
+                shifted = Image.new(image.mode, image.size, 0)
+                shifted.paste(image, (dx, dy))  # offset() wraps opposite edges.
+                result = ImageChops.lighter(result, shifted)
     return result
 
 
@@ -32,7 +34,7 @@ def layer_key(layer):
     role = layer.role or {}
     kind = "drill" if layer.kind == "drill" else role.get("kind") or layer.kind
     if kind == "other":
-        return ("other", os.path.basename(layer.data.get("file") or layer.name).lower())
+        return ("other", os.path.splitext(os.path.basename(layer.data.get("file") or layer.name))[0].lower())
     if kind == "drill":
         plating = role.get("plated")
         if plating is None:
@@ -41,10 +43,17 @@ def layer_key(layer):
         via = bool(role.get("via", False))
         name = os.path.basename(layer.data.get("file") or layer.name).lower() if via else ""
         return (kind, str(plating), str(via), name)
-    return (kind, role.get("side") or "", str(role.get("index") or ""))
+    side = role.get("side") or ""
+    # X2 bottom copper carries L2/L4/etc.; legacy .gbl has no stack index.
+    index = role.get("index") if side not in ("top", "bottom") else None
+    return (kind, side, str(index or ""))
 
 
 def pair_layers(a, b):
+    if len(a) == len(b) == 1 and a[0].kind == b[0].kind == "gerber" and (
+            layer_key(a[0])[0] == "other" or layer_key(b[0])[0] == "other"):
+        label = a[0].name + " ↔ " + b[0].name
+        return [(label, a[0], b[0])], ["单层对比含未知层类型，已按用户选择配对，请核对: " + label]
     groups = defaultdict(lambda: [[], []])
     for side, layers in enumerate((a, b)):
         for layer in layers:
@@ -118,6 +127,8 @@ def compare(pairs, bbox, resolution, tolerance, render, cancelled=lambda: False)
         raise ValueError("精度必须为正数，容差必须非负")
     scale = 1.0 / resolution
     minx, miny, maxx, maxy = bbox
+    if not all(math.isfinite(v) for v in bbox) or maxx < minx or maxy < miny:
+        raise ValueError("对比范围无效")
     width = max(1, math.ceil((maxx - minx) * scale))
     height = max(1, math.ceil((maxy - miny) * scale))
     if width * height * max(1, len(pairs)) > MAX_PIXELS:

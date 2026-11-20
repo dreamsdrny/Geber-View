@@ -8,9 +8,13 @@
 //! X2 属性 %TF-%TA-%TO-%TD (含网络名与 refdes/pin)。
 //! 正确性由"要么逐字节相同, 要么不用"保证。
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::{PyBytes, PyList};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub mod preview;
 
 const PRIM_DRAW: f64 = 0.0;
 const PRIM_FLASH: f64 = 1.0;
@@ -29,6 +33,7 @@ const KIND_P: u8 = 3;
 #[derive(Clone)]
 struct Ap {
     code: i32,
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     raw: String,
     kind: u8,
     p0: f64,
@@ -984,6 +989,7 @@ impl<'a> P<'a> {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn parse(py: Python<'_>, data: &[u8]) -> PyResult<Option<PyObject>> {
     let d = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -1062,6 +1068,7 @@ fn parse(py: Python<'_>, data: &[u8]) -> PyResult<Option<PyObject>> {
     Ok(Some(out.into()))
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn gerber_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse, m)?)?;

@@ -149,22 +149,27 @@ def _build(path, layer_name, r):
     zero = r["zero"]
 
     warnings = []
+    notes = []
     if r["has_span"]:
         max_abs = max([abs(float(v)) for v in r["span"]] or [0.0])
         if max_abs >= 10 ** int_d:
             warnings.append(
                 "坐标超出 %%FS 声明的整数位(%d位)范围, 格式声明可能与数据不符" % int_d)
     if zero == "T":
-        warnings.append("坐标为尾随零省略(FSTA)")
+        notes.append("坐标为尾随零省略(FSTA)")
     if scale != [1.0, 1.0]:
-        warnings.append("含图像比例 %%SF=%.4f/%.4f, 已按比例还原" % (scale[0], scale[1]))
+        notes.append("含图像比例 %%SF=%.4f/%.4f, 已按比例还原" % (scale[0], scale[1]))
     if any(mirror):
-        warnings.append("含图像镜像 %%MI=%s" % ("A" if mirror[0] else "") +
-                        ("B" if mirror[1] else ""))
+        notes.append("含图像镜像 %%MI=%s" % ("A" if mirror[0] else "") +
+                     ("B" if mirror[1] else ""))
     if rot:
-        warnings.append("含图像旋转 %%IR%d" % rot)
+        notes.append("含图像旋转 %%IR%d" % rot)
     if res.file_polarity.upper().startswith("NEG"):
         warnings.append("文件为负极性(FilePolarity=Negative)")
+    missing_apertures = sorted(code for code in res.ap_usage if code not in res.apertures)
+    if missing_apertures:
+        warnings.append("缺少光圈定义（RS-274D 需外部光圈表）: " +
+                        ", ".join("D" + str(code) for code in missing_apertures))
     # 与纯 Python 路径末尾的图幅合理性检查保持一致
     b = res.bbox
     if b and b[0] is not None:
@@ -173,8 +178,8 @@ def _build(path, layer_name, r):
             warnings.append(
                 "图幅 %.0f×%.0fmm 异常偏大, 请确认单位/比例声明 (可能为图纸层或拼版)" % (w, h))
         elif max(w, h) < 1:
-            warnings.append(
-                "图幅仅 %.2f×%.2fmm 异常偏小, 请确认坐标格式与单位声明" % (w, h))
+            notes.append(
+                "图元坐标范围 %.2f×%.2fmm (不含焊盘/线宽外扩)" % (w, h))
 
     return {
         "kind": "gerber",
@@ -196,6 +201,7 @@ def _build(path, layer_name, r):
         "sr_steps": 0,
         "macro_count": 0,
         "apertures": res.apertures,
+        "missing_apertures": missing_apertures,
         "primitives": res.primitives,
         "bbox": res.bbox,
         "feature_count": res.feature_count,
@@ -207,4 +213,5 @@ def _build(path, layer_name, r):
         "file_part": res.file_part,
         "aperture_function": res.aperture_function,
         "warnings": warnings,
+        "notes": notes,
     }

@@ -7,7 +7,7 @@ Gerber / Excellon NC Drill 解析
   3. Excellon NC Drill 解析 (孔径工具表/坐标/镀通孔判别)
   4. X2 属性: %TF.FileFunction、%TA.AperFunction、%TO.N 网络名
 
-输出: 统一的几何/统计数据 dict (primitives / apertures / bbox / nets / warnings)
+输出: 统一的几何/统计数据 dict (primitives / apertures / bbox / nets / warnings / notes)
 
 说明: 解析为 best-effort, 覆盖生产常见写法; 复杂宏/嵌套区域按近似处理。
 """
@@ -207,6 +207,7 @@ class GerberResult:
         self.sr_steps = 0                   # %SR 拼版复制份数
         self.macro_count = 0
         self.warnings: List[str] = []
+        self.notes: List[str] = []           # 已正常处理的格式/变换信息, 不作为解析风险
         self.apertures: Dict[int, dict] = {}
         self.primitives = PrimStore()
         self.bbox = [None, None, None, None]
@@ -770,6 +771,10 @@ def scale_fab_data(data: dict, factor: float) -> dict:
     if not data or abs(factor - 1.0) < 1e-12:
         return data
     out = dict(data)
+    # 诊断列表不能共享; 比例校正追加信息时不应污染原始数据或解析缓存。
+    for key in ("warnings", "notes"):
+        if key in data:
+            out[key] = list(data[key] or [])
     store = data.get("primitives")
     prims = None
     if isinstance(store, PrimStore):
@@ -945,9 +950,46 @@ def clear_parse_cache() -> None:
         _PARSE_CACHE.clear()
 
 
+def parse_aperture_table(text):
+    """Explicit simple RS-274D table: D10 C 0.2; D11 R 1.0 0.5.
+
+    Lengths are in the selected source unit. Unknown dialects are rejected,
+    rather than guessing widths from arbitrary CAM tool reports.
+    """
+    table = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = re.split(r"[\s,]+", line.upper())
+        try:
+            code = int(parts[0].removeprefix("D"))
+            shape = parts[1]
+            params = [float(v) for v in parts[2:]]
+            minimum = {"C": 1, "R": 2, "O": 2, "P": 2}[shape]
+            maximum = {"C": 2, "R": 3, "O": 3, "P": 4}[shape]
+            dims = 2 if shape in ("R", "O") else 1
+            if code < 10 or code in table or not minimum <= len(params) <= maximum:
+                raise ValueError()
+            if not all(math.isfinite(v) for v in params) or any(v <= 0 for v in params[:dims]):
+                raise ValueError()
+            if shape == "P" and (params[1] != int(params[1]) or not 3 <= params[1] <= 128):
+                raise ValueError()
+            hole_index = {"C": 1, "R": 2, "O": 2, "P": 3}[shape]
+            if len(params) > hole_index and params[hole_index] < 0:
+                raise ValueError()
+        except (ValueError, IndexError, KeyError):
+            raise ValueError(f"光圈表第 {number} 行无效；格式例: D10 C 0.2 / D11 R 1.0 0.5") from None
+        table[code] = {"shape": shape, "params": params}
+    return table
+
+
 def parse_gerber(path: str, layer_name: Optional[str] = None,
                  unit_override: Optional[str] = None,
-                 scale_override: Optional[float] = None) -> dict:
+                 scale_override: Optional[float] = None,
+                 format_override: Optional[Tuple[int, int]] = None,
+                 zero_mode_override: Optional[str] = None,
+                 aperture_override: Optional[dict] = None) -> dict:
     """解析 RS-274X / Gerber X2
 
     兼容各家 CAM 导出差异 (Cadence Allegro / Genesis 2000 / InCAM / Altium / KiCad /
@@ -964,14 +1006,16 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
     _check_input_size(path)
     # ---- 解析结果缓存 (同一文件重复查看时直接复用) ----
     key = None
-    if unit_override is None and scale_override is None:
+    overridden = any(v is not None for v in (unit_override, scale_override, format_override,
+                                             zero_mode_override, aperture_override))
+    if not overridden:
         key = _cache_key(path, layer_name)
         cached = _cache_get(key)
         if cached is not None:
             return cached
 
     # ---- 优先走 Rust 原生后端 (不支持时自动回退到下面的纯 Python 实现) ----
-    if unit_override is None and scale_override is None:
+    if not overridden:
         _nb = _native_backend()
         if _nb is not None:
             _native_data = _nb.parse(path, layer_name)
@@ -986,6 +1030,9 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
 
     res = GerberResult()
     res.file_name = layer_name or os.path.basename(path)
+    if aperture_override is not None:
+        res.apertures = {int(k): dict(v, params=list(v.get("params") or []))
+                         for k, v in aperture_override.items()}
 
     # ---- 解析状态 ----
     unit = "mm"
@@ -1031,6 +1078,17 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         unit_factor = INCH_TO_MM if unit == "inch" else 1.0
         res.unit = unit
         res.unit_source = "override"
+    if format_override is not None:
+        int_digits, dec_digits = format_override
+        if not (1 <= int_digits <= 7 and 0 <= dec_digits <= 7):
+            raise ValueError("坐标格式整数位需为 1..7，小数位需为 0..7")
+        res.int_digits, res.dec_digits = int_digits, dec_digits
+        pow10, fsta_total = 10 ** dec_digits, int_digits + dec_digits
+        fs_seen = True
+    if zero_mode_override is not None:
+        if zero_mode_override not in ("L", "T"):
+            raise ValueError("零省略模式必须为 L 或 T")
+        zero_mode = res.zero_mode = zero_mode_override
 
     def pt(x_raw, y_raw):
         """文件单位坐标 -> mm (单位 + 比例 + 镜像 + 旋转 + 偏移)"""
@@ -1415,10 +1473,12 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
             up = s.upper()
             m = _FS_RE.search(up)
             if m:
-                zero_mode = (m.group(1) or "L").upper()
+                zero_mode = zero_mode_override or (m.group(1) or "L").upper()
                 coord_mode = (m.group(2) or "A").upper()
                 int_digits = int(m.group(3))
                 dec_digits = int(m.group(4))
+                if format_override is not None:
+                    int_digits, dec_digits = format_override
                 fs_seen = True
                 res.zero_mode, res.coord_mode = zero_mode, coord_mode
                 res.int_digits, res.dec_digits = int_digits, dec_digits
@@ -1428,17 +1488,19 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
                 continue
             m = _MO_RE.search(up)
             if m:
-                unit = "inch" if m.group(1).upper() == "IN" else "mm"
+                unit = unit_override or ("inch" if m.group(1).upper() == "IN" else "mm")
                 unit_declared = True
                 unit_factor = INCH_TO_MM if unit == "inch" else 1.0
                 res.unit = unit
-                res.unit_source = "declared(%MO)"
+                res.unit_source = "override" if unit_override else "declared(%MO)"
                 apw_cache.clear()
                 continue
             if up.startswith("AD"):
                 parsed = _parse_aperture(s)
                 if parsed:
                     dcode, ap = parsed
+                    if aperture_override is not None and dcode in res.apertures:
+                        continue
                     res.apertures[dcode] = ap
                     vals = [p for p in ap["params"] if isinstance(p, (int, float))]
                     if vals:
@@ -1517,7 +1579,10 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
                 tf_plain = not (img_mirror[0] or img_mirror[1] or img_rot)
                 continue
             if up.startswith("AS"):
-                res.warnings.append("含 %AS 轴选择命令, 非常规输出, 建议重新导出")
+                if up == "ASAXBY":
+                    res.notes.append("轴选择 %ASAXBY, 按标准 X/Y 轴解析")
+                else:
+                    res.warnings.append("未支持的轴选择命令 %" + s + ", 请重新导出标准 X/Y 轴数据")
                 continue
             if up.startswith("IPPOS"):
                 continue
@@ -1552,14 +1617,14 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
                 elif gi == 37:
                     close_region()
                 elif gi == 70:
-                    unit, unit_declared = "inch", True
-                    unit_factor = INCH_TO_MM
-                    res.unit, res.unit_source = unit, "declared(G70)"
+                    unit, unit_declared = unit_override or "inch", True
+                    unit_factor = INCH_TO_MM if unit == "inch" else 1.0
+                    res.unit, res.unit_source = unit, "override" if unit_override else "declared(G70)"
                     apw_cache.clear()
                 elif gi == 71:
-                    unit, unit_declared = "mm", True
-                    unit_factor = 1.0
-                    res.unit, res.unit_source = unit, "declared(G71)"
+                    unit, unit_declared = unit_override or "mm", True
+                    unit_factor = INCH_TO_MM if unit == "inch" else 1.0
+                    res.unit, res.unit_source = unit, "override" if unit_override else "declared(G71)"
                     apw_cache.clear()
                 elif gi == 74:
                     quadrant_multi = False
@@ -1636,24 +1701,30 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
             res.warnings.append(
                 f"坐标超出 %FS 声明的整数位({int_digits}位)范围, 格式声明可能与数据不符")
     if zero_mode == "T":
-        res.warnings.append("坐标为尾随零省略(FSTA)")
+        res.notes.append("坐标为尾随零省略(FSTA)")
     if img_scale != [1.0, 1.0]:
-        res.warnings.append("含图像比例 %%SF=%.4f/%.4f, 已按比例还原" % tuple(img_scale))
+        res.notes.append("含图像比例 %%SF=%.4f/%.4f, 已按比例还原" % tuple(img_scale))
     if any(img_mirror):
-        res.warnings.append("含图像镜像 %%MI=%s" % ("A" if img_mirror[0] else "") +
+        res.notes.append("含图像镜像 %%MI=%s" % ("A" if img_mirror[0] else "") +
                             ("B" if img_mirror[1] else ""))
     if img_rot:
-        res.warnings.append(f"含图像旋转 %IR{img_rot}")
+        res.notes.append(f"含图像旋转 %IR{img_rot}")
     if res.sr_steps:
-        res.warnings.append(f"含拼版复制 %SR (共 {res.sr_steps + 1} 份)")
+        res.notes.append(f"含拼版复制 %SR (共 {res.sr_steps + 1} 份)")
     if macro_missing:
         res.warnings.append("引用了未定义的光圈宏: " + ",".join(sorted(macro_missing)))
     if unknown_commands:
         res.warnings.append("未支持或忽略的扩展命令: " + ", ".join(sorted(unknown_commands)[:20]))
     if region_arc_seen:
-        res.warnings.append("区域圆弧已离散化（目标弦高 0.001mm，分段数最多 4096）")
+        res.notes.append("区域圆弧已离散化（目标弦高 0.001mm，分段数最多 4096）")
     if res.file_polarity.upper().startswith("NEG"):
         res.warnings.append("文件为负极性(FilePolarity=Negative)")
+    missing_apertures = sorted(code for code in res.ap_usage if code not in res.apertures)
+    if missing_apertures:
+        res.warnings.append("缺少光圈定义（RS-274D 需外部光圈表）: " +
+                            ", ".join("D" + str(code) for code in missing_apertures))
+    if overridden:
+        res.notes.append("已应用用户指定的 Gerber 解析参数，请核对单位、格式和光圈表")
 
     res.unit = unit
     data = {
@@ -1675,6 +1746,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         "sr_steps": res.sr_steps,
         "macro_count": res.macro_count,
         "apertures": res.apertures,
+        "missing_apertures": missing_apertures,
         "primitives": res.primitives,
         "bbox": res.bbox,
         "feature_count": res.feature_count,
@@ -1687,6 +1759,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         "file_part": res.file_part,
         "aperture_function": res.aperture_function,
         "warnings": list(res.warnings),
+        "notes": list(res.notes),
     }
 
     # ---- 单位未声明: 按图幅/光圈推断, 并整体换算到 mm ----
@@ -1707,7 +1780,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
 
     if scale_override and abs(scale_override - 1.0) > 1e-9:
         data = scale_fab_data(data, scale_override)
-        data.setdefault("warnings", []).append(f"已应用人工比例校正 ×{scale_override:g}")
+        data.setdefault("notes", []).append(f"已应用人工比例校正 ×{scale_override:g}")
 
     b = data.get("bbox")
     if b and b[0] is not None:
@@ -1716,8 +1789,8 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
             data.setdefault("warnings", []).append(
                 f"图幅 {w:.0f}×{h:.0f}mm 异常偏大, 请确认单位/比例声明 (可能为图纸层或拼版)")
         elif max(w, h) < 1:
-            data.setdefault("warnings", []).append(
-                f"图幅仅 {w:.2f}×{h:.2f}mm 异常偏小, 请确认坐标格式与单位声明")
+            data.setdefault("notes", []).append(
+                f"图元坐标范围 {w:.2f}×{h:.2f}mm (不含焊盘/线宽外扩)")
     _cache_put(key, data)
     return data
 
@@ -1849,6 +1922,7 @@ def parse_excellon(path: str, plating: Optional[str] = None,
     tools: Dict[int, dict] = {}
     tool_plating: Dict[int, str] = {}
     warnings: List[str] = []
+    notes: List[str] = []
     unit = unit_override if unit_override in ("inch", "mm") else None
     unit_source = "override" if unit else ""
     zero_declared = ""
@@ -2001,7 +2075,7 @@ def parse_excellon(path: str, plating: Optional[str] = None,
     #   变长且多以 0 开头 => 前导零保留、尾随零省略 => 需右补零到最大宽度;
     #   变长且多不以 0 开头 => 前导零省略 => 直接按小数位还原。
     zero_mode = "L" if fixed_width else ("T" if lead_ratio >= 0.5 else "L")
-    if zero_declared and zero_declared != zero_mode:
+    if zero_declared and zero_declared != zero_mode and not fixed_width and not has_decimal:
         warnings.append(f"文件声明 {zero_declared}Z, 但坐标特征更像 "
                         f"{'尾随零省略' if zero_mode == 'T' else '前导零省略'}, 已按实际数据解析")
 
@@ -2027,7 +2101,7 @@ def parse_excellon(path: str, plating: Optional[str] = None,
     if dec_digits is None:
         if has_decimal:
             dec_digits = 0
-            warnings.append("坐标带小数点, 直接按数值解析")
+            notes.append("坐标带小数点, 直接按数值解析")
         else:
             std = None
             if fixed_width and max_digits:
@@ -2237,7 +2311,7 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         holes = scaled["holes"]
         bbox = scaled["bbox"]
         tools = scaled["tools"]
-        warnings.append(f"已应用人工比例校正 ×{scale_override:g}")
+        notes.append(f"已应用人工比例校正 ×{scale_override:g}")
 
     diameters = [h["diameter_mm"] for h in holes if h.get("diameter_mm")]
     data = {
@@ -2258,6 +2332,7 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         "max_hole_mm": round(max(diameters), 4) if diameters else None,
         "bbox": bbox,
         "warnings": warnings,
+        "notes": notes,
     }
     _cache_put(key, data)
     return data

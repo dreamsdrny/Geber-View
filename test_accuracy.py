@@ -3,14 +3,17 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
 from gerber_diff import _dilate_mm, compare, pair_layers
 from gerber_project import load, save
-from gerber_reader import PrimStore, _arc_sample, parse_gerber
+from gerber_reader import PrimStore, _arc_sample, parse_excellon, parse_gerber
 from gerber_report import manufacturing, write_diff_csv
 from gerber_viewer import GerberLayer, GerberViewer
+import gerber_native
+import gerber_reader
 
 
 def viewer():
@@ -45,6 +48,90 @@ class AccuracyTests(unittest.TestCase):
             pts = data["primitives"].extras[0][0]
             self.assertGreater(len(pts), 10)
             self.assertTrue(any(x > .6 and y > .6 for x, y in pts))
+            self.assertFalse(data["warnings"])
+            self.assertTrue(any("圆弧" in n for n in data["notes"]))
+
+    def test_supported_formats_are_information_not_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "standard.gbr")
+            with open(path, "w", encoding="ascii") as f:
+                f.write("%FSTAX34Y34*%%MOMM*%%ASAXBY*%%ADD10C,0.2*%"
+                        "%SFA2B2*%%MIA1B0*%%IR90*%%SRX2Y1I2.0J0.0*%"
+                        "D10*X1Y1D03*%SR*%M02*")
+            data = parse_gerber(path)
+            self.assertEqual(data["warnings"], [])
+            self.assertEqual(data["feature_count"], 2)
+            for feature in ("轴选择", "尾随零", "比例", "镜像", "旋转", "拼版"):
+                self.assertTrue(any(feature in n for n in data["notes"]), feature)
+            ly = GerberLayer("standard", data, "#ffffff")
+            self.assertIn("信息:", ly.detail_text())
+            self.assertIn("信息:", manufacturing([ly]))
+
+    def test_real_parser_risks_remain_warnings(self):
+        cases = {
+            "axes": "%FSLAX34Y34*%%MOMM*%%ASAYBX*%",
+            "unknown": "%FSLAX34Y34*%%MOMM*%%ZZTEST*%",
+            "format": "%MOMM*%",
+            "unit": "%FSLAX34Y34*%",
+            "macro": "%FSLAX34Y34*%%MOMM*%%ADD10MISSING*%",
+            "negative": "%FSLAX34Y34*%%MOMM*%%TF.FilePolarity,Negative*%",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, header in cases.items():
+                with self.subTest(name=name):
+                    path = os.path.join(tmp, name + ".gbr")
+                    with open(path, "w", encoding="ascii") as f:
+                        f.write(header + "%ADD11C,0.2*%D10*X10000Y10000D03*M02*")
+                    self.assertTrue(parse_gerber(path)["warnings"])
+
+    def test_single_pad_is_not_an_abnormal_board_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pad.gbr")
+            with open(path, "w", encoding="ascii") as f:
+                f.write("%FSLAX34Y34*%%MOMM*%%ADD10C,2.0*%D10*X10000Y10000D03*M02*")
+            data = parse_gerber(path)
+            self.assertFalse(data["warnings"])
+            self.assertEqual(GerberLayer("pad", data, "#fff").local_bbox(), [0, 0, 2, 2])
+
+    def test_decimal_drill_and_fixed_width_zero_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "decimal.drl")
+            with open(path, "w", encoding="ascii") as f:
+                f.write("M48\nMETRIC,TZ\nT1C0.3\n%\nT1\nX10.0Y10.0\nX20.0Y20.0\nM30\n")
+            data = parse_excellon(path)
+            self.assertEqual(data["warnings"], [])
+            self.assertEqual(data["hole_count"], 2)
+            self.assertTrue(any("小数点" in n for n in data["notes"]))
+            path = os.path.join(tmp, "fixed.drl")
+            with open(path, "w", encoding="ascii") as f:
+                f.write("M48\n;FILE_FORMAT=3:3\nMETRIC,TZ\nT1C0.3\n%\nT1\n"
+                        "X010000Y010000\nX020000Y020000\nM30\n")
+            data = parse_excellon(path)
+            self.assertFalse(any("坐标特征" in w for w in data["warnings"]))
+            self.assertEqual([h["x"] for h in data["holes"]], [10, 20])
+
+    def test_native_and_python_diagnostics_agree(self):
+        if not gerber_native.available():
+            self.skipTest("optional native backend unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "transforms.gbr")
+            with open(path, "w", encoding="ascii") as f:
+                f.write("%FSTAX34Y34*%%MOMM*%%ADD10C,0.2*%%SFA2B2*%%MIA1B0*%%IR90*%"
+                        "D10*X1Y1D03*X2Y2D03*M02*")
+            native = gerber_native.parse(path)
+            self.assertIsNotNone(native)
+            with patch.object(gerber_reader, "_native_backend", return_value=None):
+                python = parse_gerber(path)
+            for key in ("warnings", "notes", "bbox", "feature_count"):
+                self.assertEqual(native[key], python[key], key)
+
+    def test_scale_notes_do_not_mutate_cached_diagnostics(self):
+        source = {"warnings": ["单位需核对"], "notes": ["已处理镜像"], "unit": "mm"}
+        scaled = gerber_reader.scale_fab_data(source, 2)
+        scaled["notes"].append("比例校正")
+        scaled["warnings"].append("新警告")
+        self.assertEqual(source["notes"], ["已处理镜像"])
+        self.assertEqual(source["warnings"], ["单位需核对"])
 
     def test_slot_render_and_aperture_hole(self):
         v = viewer()

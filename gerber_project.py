@@ -21,7 +21,8 @@ def make_project(layers, path):
         records.append({"path": source, "name": layer.name, "group": layer.group,
                         "color": layer.color, "visible": layer.visible,
                         "scale": layer.scale_factor, "offset": list(layer.offset),
-                        "mirror_x": layer.mirror_x})
+                        "mirror_x": layer.mirror_x,
+                        "parse_options": getattr(layer, "parse_options", {})})
     return {"version": VERSION, "layers": records}
 
 
@@ -53,7 +54,31 @@ def load(path):
         group = item.get("group", "")
         if group not in ("", "A", "B"):
             raise ValueError("工程图层分组无效")
+        options = item.get("parse_options", {})
+        allowed = {"unit_override", "format_override", "zero_mode_override", "aperture_override"}
+        if not isinstance(options, dict) or set(options) - allowed:
+            raise ValueError("工程 Gerber 解析参数无效")
+        if options:
+            from gerber_reader import parse_aperture_table
+            unit = options.get("unit_override")
+            zero = options.get("zero_mode_override")
+            digits = options.get("format_override")
+            table = options.get("aperture_override")
+            if unit not in (None, "mm", "inch") or zero not in (None, "L", "T"):
+                raise ValueError("工程 Gerber 单位/零省略参数无效")
+            if digits is not None and (not isinstance(digits, list) or len(digits) != 2 or
+                    not all(type(v) is int for v in digits) or not (1 <= digits[0] <= 7 and 0 <= digits[1] <= 7)):
+                raise ValueError("工程 Gerber 坐标格式无效")
+            if table is not None:
+                if not isinstance(table, dict) or len(table) > 10000:
+                    raise ValueError("工程光圈表无效")
+                try:
+                    lines = [f"D{code} {ap['shape']} " + " ".join(str(v) for v in ap["params"])
+                             for code, ap in table.items()]
+                    options = dict(options, aperture_override=parse_aperture_table("\n".join(lines)))
+                except (KeyError, TypeError):
+                    raise ValueError("工程光圈表无效") from None
         record = dict(item, path=os.path.abspath(os.path.join(base, item["path"])),
-                      scale=factor, offset=offset, group=group)
+                      scale=factor, offset=offset, group=group, parse_options=options)
         result.append(record)
     return result

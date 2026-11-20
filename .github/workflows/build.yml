@@ -49,7 +49,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: '1'
         run: |
-          python -B -m unittest -v test_accuracy
+          python -B -m unittest -v test_accuracy test_measure_compare
           python -B test_gui.py
 
       - name: 编译 Rust 原生内核 (可选加速; 失败则打包纯 Python 版本)
@@ -71,7 +71,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: '1'
         run: |
-          python -B -m unittest -v test_accuracy
+          python -B -m unittest -v test_accuracy test_measure_compare
           python -B test_gui.py
 
       - name: 打包目录版 (dist/Evan_Gerber_View/Evan_Gerber_View.exe)

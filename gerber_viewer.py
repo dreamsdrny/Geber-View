@@ -4,7 +4,7 @@ Evan Gerber View: Gerber 查看器 (KiCad 风格) + 多层 A/B 叠加对比 + �
 功能:
   - 导入多个 Gerber / 钻孔 (线路/阻焊/丝印/钻孔等), 按【层类型】自动分配不同颜色
   - 缩放(滚轮)/平移(右键拖动)/适应窗口; 选中图层可单独拖动对齐
-  - 多层 A/B 对比: A/B 各可导入【多层】(多文件或整个目录), 自动按中心对齐
+  - 多层 A/B 对比: A/B 各可导入【多层】(多文件或整个目录), 可手动中心对齐
   - 自动定位差异: 栅格化 A/B 材料 mask 做 XOR, 输出差异位置(XY)+信息, 图上高亮
   - 网络高亮: 画布双击焊盘/走线 -> 高亮整条网络 (读 %TO.N/%TO.P 属性)
   - 单层 Solo 隔离、测距/测角度、导出 PNG
@@ -362,7 +362,9 @@ class GerberLayer:
             bits.append(f"比例校正: ×{self.scale_factor:g}" + ("(自动)" if self.auto_scaled else ""))
         w = self.warn_text()
         if w:
-            bits.append("提示: " + w)
+            bits.append("警告: " + w)
+        if d.get("notes"):
+            bits.append("信息: " + "; ".join(str(n) for n in d["notes"]))
         return "  |  ".join(bits)
 
     def _raw_bbox(self):
@@ -464,6 +466,8 @@ class GerberViewer:
         self._measure_on = False
         self._measure_pts = []              # 测距点 (mm)
         self._measure_cur = None
+        self._measure_features = []
+        self._measure_hover = None
         self._hover_job = None              # 坐标读数节流定时器
         self._hover_xy = None
         self._cfg_job = None                # 窗口尺寸变化防抖定时器
@@ -495,130 +499,140 @@ class GerberViewer:
 
     # ---------------- UI ----------------
     def _build(self):
-        top = ttk.Frame(self.win, padding=6)
-        top.pack(fill=tk.X)
-        ttk.Button(top, text="导入文件夹(自动)...", command=self._import_dir).pack(side=tk.LEFT)
-        ttk.Button(top, text="导入Gerber文件...", command=self._import_gerber).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="导入钻孔...", command=self._import_drill).pack(side=tk.LEFT)
         self.auto_siblings = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="自动带入同目录",
-                        variable=self.auto_siblings).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(top, text="对比A: 导入多层", command=lambda: self._compare_load("A")).pack(side=tk.LEFT)
-        ttk.Button(top, text="对比B: 导入多层", command=lambda: self._compare_load("B")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="自动定位差异", command=self._auto_diff).pack(side=tk.LEFT)
-        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(top, text="清空", command=self._clear).pack(side=tk.LEFT)
-        ttk.Button(top, text="导出PNG", command=self._export_png).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="关闭", command=self.win.destroy).pack(side=tk.RIGHT)
-
-        bar = ttk.Frame(self.win, padding=(6, 0))
-        bar.pack(fill=tk.X)
-        ttk.Button(bar, text="适应", command=self.fit).pack(side=tk.LEFT)
-        ttk.Button(bar, text="视图放大", command=lambda: self._zoom(1.25)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bar, text="视图缩小", command=lambda: self._zoom(0.8)).pack(side=tk.LEFT)
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Label(bar, text="选中图层:").pack(side=tk.LEFT)
-        ttk.Button(bar, text="居中", command=self._center_sel).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="重置偏移", command=self._reset_sel).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="镜像", command=self._mirror_sel).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="改颜色", command=self._pick_color).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="上移", command=lambda: self._move_layer(1)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="下移", command=lambda: self._move_layer(-1)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="删除", command=self._delete_sel).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="对齐中心", command=self._align_center).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="对齐左下", command=self._align_bl).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        mb = ttk.Menubutton(bar, text="比例校正")
-        mnu = tk.Menu(mb, tearoff=0)
-        mnu.add_command(label="选中层 ×25.4  (英寸被当成毫米)",
-                        command=lambda: self._scale_sel(25.4))
-        mnu.add_command(label="选中层 ÷25.4  (毫米被当成英寸)",
-                        command=lambda: self._scale_sel(1.0 / 25.4))
-        mnu.add_command(label="选中层 ×10  (小数位少一位)", command=lambda: self._scale_sel(10.0))
-        mnu.add_command(label="选中层 ÷10  (小数位多一位)", command=lambda: self._scale_sel(0.1))
-        mnu.add_command(label="选中层 自定义比例...", command=self._scale_sel_custom)
-        mnu.add_command(label="选中层 恢复原始比例", command=self._scale_sel_reset)
-        mnu.add_separator()
-        mnu.add_command(label="钻孔层对齐线路层 (自动识别 10/25.4 倍)",
-                        command=lambda: self._auto_check_scales(True, True))
-        mnu.add_command(label="B组尺寸匹配A组 (等比缩放)", command=self._scale_b_to_a)
-        mnu.add_command(label="检查所有图层比例一致性", 
-                        command=lambda: self._auto_check_scales(False, True))
-        mb["menu"] = mnu
-        mb.pack(side=tk.LEFT, padx=2)
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self.move_mode = tk.BooleanVar(value=False)
         self._measure_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="测距/测角", variable=self._measure_var,
-                        command=self._measure_toggle).pack(side=tk.LEFT)
-        ttk.Button(bar, text="清除高亮", command=self._clear_overlays).pack(side=tk.LEFT, padx=4)
-        self.move_mode = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="拖动移动图层", variable=self.move_mode).pack(side=tk.LEFT, padx=6)
-        self.info = tk.StringVar(
-            value="左键拖动=移动图层；右键拖动=平移；滚轮=缩放；画布双击=高亮整条网络；Esc=清除")
-        ttk.Label(bar, textvariable=self.info, foreground="#555").pack(side=tk.RIGHT)
-
-        tools = ttk.Frame(self.win, padding=(6, 2))
-        tools.pack(fill=tk.X)
-        ttk.Button(tools, text="保存工程", command=self._save_project).pack(side=tk.LEFT)
-        ttk.Button(tools, text="打开工程", command=self._open_project).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tools, text="取消导入", command=self._cancel_import).pack(side=tk.LEFT)
-        ttk.Button(tools, text="取消对比", command=self._cancel_diff).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tools, text="解析问题", command=self._show_diagnostics).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tools, text="制造报告", command=self._manufacturing_report).pack(side=tk.LEFT)
-        ttk.Button(tools, text="导出差异CSV", command=self._export_diff_csv).pack(side=tk.LEFT, padx=3)
         self._snap_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tools, text="测距吸附焊盘/孔中心", variable=self._snap_var).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tools, text="B组中心对齐", command=self._align_group_b_to_a).pack(side=tk.LEFT)
-        ttk.Button(tools, text="B组原始坐标", command=self._reset_group_b).pack(side=tk.LEFT, padx=3)
-
-        body = ttk.Frame(self.win)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        left = ttk.LabelFrame(body, text="图层 (点『开/关』列开关)", padding=4)
-        left.pack(side=tk.LEFT, fill=tk.Y)
-        btnbar = ttk.Frame(left)
-        btnbar.pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(btnbar, text="全开", width=5, command=self._all_on).pack(side=tk.LEFT)
-        ttk.Button(btnbar, text="一键全关", width=8, command=self._all_off).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btnbar, text="开选中", width=6, command=lambda: self._set_sel(True)).pack(side=tk.LEFT)
-        ttk.Button(btnbar, text="关选中", width=6, command=lambda: self._set_sel(False)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btnbar, text="反选", width=5, command=self._invert).pack(side=tk.LEFT)
-        ttk.Button(btnbar, text="Solo", width=5, command=self._solo_toggle).pack(side=tk.LEFT, padx=2)
-
+        self._measure_mode = tk.StringVar(value="中心到中心")
+        self._bounds_var = tk.BooleanVar(value=False)
+        self._markers_var = tk.BooleanVar(value=True)
+        self.info = tk.StringVar(value="滚轮缩放 · 拖动平移 · 双击高亮网络")
+        self.status = tk.StringVar(value="就绪 — 导入 Gerber 或钻孔文件开始查看")
+        self._status_display = tk.StringVar(value=self.status.get())
+        self._coordinates = tk.StringVar(value="X —    Y —    mm")
+        self._view_summary = tk.StringVar(value="画布")
+        self._layer_summary = tk.StringVar(value="0 个图层")
+        self._measure_readout = tk.StringVar(value="尚未量测")
+        self.compare_summary = tk.StringVar()
         ui = self._ui_scale()
         style = ttk.Style(self.win)
-        try:
-            style.configure("GerberLayers.Treeview",
-                            font=("Microsoft YaHei UI", 11), rowheight=int(28 * ui))
-            style.configure("GerberLayers.Treeview.Heading",
-                            font=("Microsoft YaHei UI", 10, "bold"))
-        except Exception:
-            pass
-        # 行高随 DPI 放大, 可见行数相应减少 -> 总高度不变, 文字不会被裁掉
-        self.tree = ttk.Treeview(left, columns=("st", "name", "type", "unit"), show="headings",
-                                 height=max(8, int(26 / ui)), selectmode="extended",
-                                 style="GerberLayers.Treeview")
+        style.configure("Gerber.Title.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Gerber.Muted.TLabel", foreground="#64748b")
+        style.configure("GerberLayers.Treeview", font=("Microsoft YaHei UI", 10), rowheight=int(28 * ui))
+        style.configure("GerberLayers.Treeview.Heading", font=("Microsoft YaHei UI", 9))
+        self.win.minsize(int(820 * ui), int(560 * ui))
+        self._build_menus()
+
+        # One compact toolbar; infrequent operations live in menus and panels.
+        self.toolbar = ttk.Frame(self.win, padding=(10, 6))
+        self.toolbar.pack(fill=tk.X)
+        ttk.Button(self.toolbar, text="导入文件", command=self._import_gerber).pack(side=tk.LEFT)
+        ttk.Button(self.toolbar, text="导入文件夹", command=self._import_dir).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Separator(self.toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Button(self.toolbar, text="适应窗口", command=self.fit).pack(side=tk.LEFT)
+        ttk.Button(self.toolbar, text="−", width=3, command=lambda: self._zoom(.8)).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Button(self.toolbar, text="+", width=3, command=lambda: self._zoom(1.25)).pack(side=tk.LEFT)
+        ttk.Separator(self.toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Button(self.toolbar, text="A/B 对比", command=lambda: self._show_panel("compare")).pack(side=tk.LEFT)
+        ttk.Checkbutton(self.toolbar, text="测距", variable=self._measure_var,
+                        command=self._measure_toggle).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(self.toolbar, text="移动图层", variable=self.move_mode,
+                        command=self._move_mode_toggle).pack(side=tk.LEFT)
+        ttk.Separator(self.win, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        # Reserve the single-line status bar before the expanding work area.
+        footer = ttk.Frame(self.win, padding=(10, 4))
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=self._status_display, width=1, anchor=tk.W).grid(row=0, column=0, sticky="ew")
+        ttk.Separator(footer, orient=tk.VERTICAL).grid(row=0, column=1, sticky="ns", padx=10)
+        ttk.Label(footer, textvariable=self._coordinates, width=34, anchor=tk.E,
+                  style="Gerber.Muted.TLabel").grid(row=0, column=2)
+        self.status.trace_add("write", lambda *_: self._status_display.set(self.status.get().split("\n", 1)[0]))
+
+        self.workspace = ttk.Panedwindow(self.win, orient=tk.HORIZONTAL)
+        self.workspace.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.sidebar = ttk.Frame(self.workspace, width=int(310 * ui))
+        self.workspace.add(self.sidebar, weight=0)
+        self.side_tabs = ttk.Notebook(self.sidebar)
+        self.side_tabs.pack(fill=tk.BOTH, expand=True)
+        layers_panel = ttk.Frame(self.side_tabs, padding=8)
+        self.compare_panel = ttk.Frame(self.side_tabs, padding=10)
+        self.measure_panel = ttk.Frame(self.side_tabs, padding=10)
+        self._panels = {"layers": layers_panel, "compare": self.compare_panel, "measure": self.measure_panel}
+        for key, title in (("layers", "图层"), ("compare", "A/B 对比"), ("measure", "量测")):
+            self.side_tabs.add(self._panels[key], text=title)
+
+        layers_panel.columnconfigure(0, weight=1)
+        layers_panel.rowconfigure(2, weight=1)
+        ttk.Label(layers_panel, textvariable=self._layer_summary, style="Gerber.Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        left = ttk.Frame(layers_panel)
+        left.grid(row=2, column=0, sticky="nsew")
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        btnbar = ttk.Frame(layers_panel)
+        btnbar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(btnbar, text="全开", width=5, command=self._all_on).pack(side=tk.LEFT)
+        ttk.Button(btnbar, text="全关", width=5, command=self._all_off).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btnbar, text="反选", width=5, command=self._invert).pack(side=tk.LEFT)
+        ttk.Button(btnbar, text="Solo", width=5, command=self._solo_toggle).pack(side=tk.RIGHT)
+        self._color_swatches = {}          # 保留 PhotoImage 引用; 隐藏层也可单击改色
+        self.tree = ttk.Treeview(left, columns=("st", "name", "type", "unit"), show="tree headings",
+                                  displaycolumns=("st", "name", "type"), height=8, selectmode="extended",
+                                  style="GerberLayers.Treeview")
         self.tree.heading("st", text="开/关")
+        self.tree.heading("#0", text="颜色")
         self.tree.heading("name", text="图层")
         self.tree.heading("type", text="类型")
         self.tree.heading("unit", text="单位/格式")
-        self.tree.column("st", width=int(54 * ui), anchor=tk.CENTER, stretch=False)
-        self.tree.column("name", width=int(196 * ui), anchor=tk.W)
-        self.tree.column("type", width=int(72 * ui), anchor=tk.CENTER, stretch=False)
+        self.tree.column("st", width=int(42 * ui), minwidth=int(42 * ui), anchor=tk.CENTER, stretch=False)
+        self.tree.column("#0", width=int(40 * ui), minwidth=int(40 * ui), stretch=False)
+        self.tree.column("name", width=int(136 * ui), minwidth=int(72 * ui), anchor=tk.W)
+        self.tree.column("type", width=int(64 * ui), minwidth=int(64 * ui), anchor=tk.CENTER, stretch=False)
         self.tree.column("unit", width=int(86 * ui), anchor=tk.CENTER, stretch=False)
-        self.tree.pack(side=tk.LEFT, fill=tk.Y)
+        self.tree.grid(row=0, column=0, sticky="nsew")
         tsb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tsb.set)
-        tsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=tsb.set, xscrollcommand=hsb.set)
+        tsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
         self.tree.tag_configure("off", foreground="#8a8a8a")
         self.tree.tag_configure("warn", foreground="#c47b00")
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Double-Button-1>", self._on_tree_dbl)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Button-3>", self._layer_context)
+        ttk.Label(layers_panel, text="点色块改色 · 点开关显示 · 右键图层操作",
+                  style="Gerber.Muted.TLabel", width=1).grid(row=3, column=0, sticky="ew", pady=6)
+        ttk.Separator(layers_panel).grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(layers_panel, text="选中图层", style="Gerber.Title.TLabel").grid(row=5, column=0, sticky="w")
+        self.layer_details = tk.Text(layers_panel, height=6, width=1, wrap="word", relief="flat",
+                                     font=("Microsoft YaHei UI", 9), borderwidth=0, padx=2, pady=6,
+                                     bg=style.lookup("TFrame", "background") or "#f0f0f0",
+                                     fg="#475569", state="disabled")
+        self.layer_details.grid(row=6, column=0, sticky="ew")
+        self.info_label = ttk.Label(self.sidebar, textvariable=self.info, width=1,
+                                    wraplength=int(285 * ui), anchor="nw", style="Gerber.Muted.TLabel")
+        self.info_label.pack(fill=tk.X, padx=10, pady=8)
+        self.sidebar.bind("<Configure>", self._sidebar_resize)
 
-        self.canvas = tk.Canvas(body, bg="#0f1115", highlightthickness=0)
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._build_compare_panel()
+        self._build_measure_panel()
+        view = ttk.Frame(self.workspace)
+        self.workspace.add(view, weight=1)
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(1, weight=1)
+        viewbar = ttk.Frame(view, padding=(8, 5))
+        viewbar.grid(row=0, column=0, sticky="ew")
+        viewbar.columnconfigure(0, weight=1)
+        ttk.Label(viewbar, textvariable=self._view_summary, width=1,
+                  style="Gerber.Muted.TLabel").grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(viewbar, text="差异标记", variable=self._markers_var,
+                        command=self._schedule_render).grid(row=0, column=1, padx=6)
+        ttk.Checkbutton(viewbar, text="选中框", variable=self._bounds_var,
+                        command=self._schedule_render).grid(row=0, column=2)
+        self.canvas = tk.Canvas(view, bg="#0f1115", highlightthickness=0, width=1, height=1)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
@@ -632,10 +646,178 @@ class GerberViewer:
         self.canvas.bind("<Escape>", self._clear_overlays)
         self.canvas.bind_all("<Escape>", self._clear_overlays)
         self.canvas.bind("<Motion>", self._on_motion_measure, add="+")
+        self.canvas.bind("<Leave>", self._canvas_leave)
+        self._update_compare_summary()
+        self._update_layer_details()
+        self.win.after_idle(lambda: self.workspace.sashpos(0, int(310 * ui)))
 
-        self.status = tk.StringVar(value="Ready")
-        ttk.Label(self.win, textvariable=self.status, relief=tk.SUNKEN,
-                  anchor=tk.W).pack(fill=tk.X, side=tk.BOTTOM)
+    def _build_menus(self):
+        self.menu = tk.Menu(self.win)
+        self.win.configure(menu=self.menu)
+        files = tk.Menu(self.menu, tearoff=0)
+        for label, command in (("导入 Gerber / 制造文件…", self._import_gerber),
+                               ("导入文件夹…", self._import_dir), ("导入钻孔…", self._import_drill),
+                               ("取消导入", self._cancel_import)):
+            files.add_command(label=label, command=command)
+        files.add_checkbutton(label="自动带入同目录", variable=self.auto_siblings)
+        files.add_separator()
+        for label, command in (("打开工程…", self._open_project), ("保存工程…", self._save_project),
+                               ("导出 PNG…", self._export_png), ("清空图层", self._clear), ("关闭", self._on_close)):
+            files.add_command(label=label, command=command)
+        self.menu.add_cascade(label="文件", menu=files)
+
+        self.layer_menu = tk.Menu(self.menu, tearoff=0)
+        for label, command in (("仅显示选中层 / Solo", self._solo_toggle),
+                               ("显示选中层", lambda: self._set_sel(True)),
+                               ("隐藏选中层", lambda: self._set_sel(False)), ("更改颜色…", self._pick_color),
+                               ("上移", lambda: self._move_layer(1)), ("下移", lambda: self._move_layer(-1)),
+                               ("删除选中层", self._delete_sel)):
+            self.layer_menu.add_command(label=label, command=command)
+        self.layer_menu.add_separator()
+        self.layer_menu.add_checkbutton(label="拖动移动图层", variable=self.move_mode, command=self._move_mode_toggle)
+        for label, command in (("居中 / 清除偏移", self._center_sel), ("重置偏移与镜像", self._reset_sel),
+                               ("镜像", self._mirror_sel), ("对齐中心", self._align_center), ("对齐左下", self._align_bl)):
+            self.layer_menu.add_command(label=label, command=command)
+        self.menu.add_cascade(label="图层", menu=self.layer_menu)
+
+        scale = tk.Menu(self.menu, tearoff=0)
+        for label, factor in (("选中层 ×25.4", 25.4), ("选中层 ÷25.4", 1 / 25.4),
+                              ("选中层 ×10", 10.), ("选中层 ÷10", .1)):
+            scale.add_command(label=label, command=lambda f=factor: self._scale_sel(f))
+        for label, command in (("自定义比例…", self._scale_sel_custom), ("恢复原始比例", self._scale_sel_reset),
+                               ("钻孔层比例校正", lambda: self._auto_check_scales(True, True)),
+                               ("B组尺寸匹配A组", self._scale_b_to_a),
+                               ("检查比例一致性", lambda: self._auto_check_scales(False, True))):
+            scale.add_command(label=label, command=command)
+        tools = tk.Menu(self.menu, tearoff=0)
+        tools.add_cascade(label="比例校正", menu=scale)
+        for label, command in (("RS-274D 参数…", self._legacy_parameters), ("解析问题…", self._show_diagnostics),
+                               ("制造报告…", self._manufacturing_report), ("清除高亮 / 测距", self._clear_overlays)):
+            tools.add_command(label=label, command=command)
+        self.menu.add_cascade(label="工具", menu=tools)
+        view = tk.Menu(self.menu, tearoff=0)
+        view.add_command(label="适应窗口", command=self.fit)
+        for key, title in (("layers", "图层面板"), ("compare", "A/B 对比面板"), ("measure", "量测面板")):
+            view.add_command(label=title, command=lambda k=key: self._show_panel(k))
+        view.add_checkbutton(label="显示选中框", variable=self._bounds_var, command=self._schedule_render)
+        view.add_checkbutton(label="显示差异标记", variable=self._markers_var, command=self._schedule_render)
+        self.menu.add_cascade(label="视图", menu=view)
+
+    def _build_compare_panel(self):
+        panel = self.compare_panel
+        panel.columnconfigure(0, weight=1)
+        ttk.Label(panel, text="逐层对比", style="Gerber.Title.TLabel").grid(row=0, column=0, sticky="w")
+        self._wrapped_labels = []
+        def note(text, row):
+            label = ttk.Label(panel, text=text, width=1, wraplength=270, style="Gerber.Muted.TLabel")
+            label.grid(row=row, column=0, sticky="ew", pady=(4, 10))
+            self._wrapped_labels.append(label)
+        note("1. 导入 A、B 两组\n2. 核对坐标和图层\n3. 计算差异并定位", 1)
+        for row, group in ((2, "A"), (3, "B")):
+            box = ttk.LabelFrame(panel, text=group + " 组", padding=8)
+            box.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+            box.columnconfigure((0, 1), weight=1)
+            ttk.Button(box, text=group + "组: 导入文件", command=lambda g=group: self._compare_load(g)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+            ttk.Button(box, text=group + "组: 导入文件夹", command=lambda g=group: self._compare_load(g, directory=True)).grid(row=0, column=1, sticky="ew")
+        alignment = ttk.Frame(panel)
+        alignment.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        alignment.columnconfigure((0, 1), weight=1)
+        ttk.Button(alignment, text="B组中心对齐", command=self._align_group_b_to_a).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(alignment, text="B组原始坐标", command=self._reset_group_b).grid(row=0, column=1, sticky="ew")
+        ttk.Button(panel, text="自动定位差异", command=self._auto_diff).grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        results = ttk.Frame(panel)
+        results.grid(row=6, column=0, sticky="ew")
+        results.columnconfigure((0, 1), weight=1)
+        ttk.Button(results, text="查看差异结果", command=self._view_diff_results).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(results, text="导出差异CSV", command=self._export_diff_csv).grid(row=0, column=1, sticky="ew")
+        ttk.Button(panel, text="取消对比", command=self._cancel_diff).grid(row=7, column=0, sticky="ew", pady=8)
+        label = ttk.Label(panel, textvariable=self.compare_summary, width=1, wraplength=270, style="Gerber.Muted.TLabel")
+        label.grid(row=8, column=0, sticky="ew", pady=(4, 0))
+        self._wrapped_labels.append(label)
+
+    def _build_measure_panel(self):
+        panel = self.measure_panel
+        panel.columnconfigure(0, weight=1)
+        ttk.Label(panel, text="几何量测", style="Gerber.Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(panel, text="量测方式").grid(row=1, column=0, sticky="w", pady=(0, 4))
+        self.measure_modes = ttk.Combobox(panel, textvariable=self._measure_mode, state="readonly", width=15,
+                                          values=("自由点/夹角", "中心到中心", "边到边", "中心到边"))
+        self.measure_modes.grid(row=2, column=0, sticky="ew")
+        self.measure_modes.bind("<<ComboboxSelected>>", self._measure_mode_changed)
+        ttk.Checkbutton(panel, text="启用量测", variable=self._measure_var,
+                        command=self._measure_toggle).grid(row=3, column=0, sticky="w", pady=10)
+        ttk.Checkbutton(panel, text="自由点吸附中心", variable=self._snap_var).grid(row=4, column=0, sticky="w")
+        ttk.Button(panel, text="重新测量", command=self._measure_mode_changed).grid(row=5, column=0, sticky="ew", pady=10)
+        ttk.Separator(panel).grid(row=6, column=0, sticky="ew", pady=8)
+        ttk.Label(panel, text="量测结果", style="Gerber.Title.TLabel").grid(row=7, column=0, sticky="w")
+        for row, var, text in ((8, self._measure_readout, None), (9, None,
+                "依次点选两个图形，黄色为当前抓取。\n边到边显示最短净距；自由点第三点测夹角。\nEsc 退出，右键拖动平移。")):
+            label = ttk.Label(panel, textvariable=var, text=text or "", width=1, wraplength=270,
+                              justify=tk.LEFT, style="Gerber.Muted.TLabel")
+            label.grid(row=row, column=0, sticky="ew", pady=10)
+            self._wrapped_labels.append(label)
+
+    def _show_panel(self, key):
+        self.side_tabs.select(self._panels[key])
+
+    def _sidebar_resize(self, event):
+        width = max(120, event.width - 32)
+        self.info_label.configure(wraplength=width)
+        for label in getattr(self, "_wrapped_labels", []):
+            label.configure(wraplength=width)
+
+    def _layer_context(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        if row not in self.tree.selection():
+            self.tree.selection_set(row)
+        self.selected = int(row)
+        self._update_layer_details()
+        try:
+            self.layer_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.layer_menu.grab_release()
+        return "break"
+
+    def _update_layer_details(self):
+        widget = getattr(self, "layer_details", None)
+        if widget is None:
+            return
+        ly = self._sel_layer()
+        if ly is None:
+            text = "选择图层查看单位、图幅及变换。"
+        else:
+            box = ly.local_bbox()
+            size = f"{box[2] - box[0]:.2f} × {box[3] - box[1]:.2f} mm" if box else "—"
+            text = (f"{ly.name}\n{ly.type_label()} · {ly.unit_label()}\n图幅 {size}\n"
+                    f"偏移 {ly.offset[0]:+.4f}, {ly.offset[1]:+.4f} mm" + (" · 镜像" if ly.mirror_x else ""))
+            if ly.warn_text():
+                text += "\n⚠ " + ly.warn_text()
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _move_mode_toggle(self):
+        if self.move_mode.get():
+            if self._measure_on:
+                self._measure_on = False
+                self._measure_var.set(False)
+                self._measure_mode_changed()
+            self._show_panel("layers")
+            self.status.set("移动图层模式 — 左键拖动选中层，右键平移")
+        else:
+            self.status.set("浏览模式 — 左键或右键拖动平移，滚轮缩放")
+        self._drag = None
+        self.canvas.configure(cursor="fleur" if self.move_mode.get() else "")
+        self._schedule_render()
+
+    def _canvas_leave(self, _event=None):
+        self._hover_xy = None
+        self._measure_hover = None
+        self._measure_cur = None
+        self._refresh_measure()
 
     # ---------------- 后台线程 ----------------
     def _start_workers(self):
@@ -682,7 +864,7 @@ class GerberViewer:
                     if kind == "drill":
                         data = parse_excellon(p)
                     else:
-                        data = parse_gerber(p, layer_name=base)
+                        data = parse_gerber(p, layer_name=base, **record.get("parse_options", {}))
                     self._ui_q.put(("layer", data, p, record.get("group", group), len(records), generation, record))
                 except Exception as exc:  # noqa: BLE001
                     self._ui_q.put(("parse_err", base, str(exc), generation))
@@ -751,10 +933,24 @@ class GerberViewer:
             _, data, path, group, batch_size, generation, record = msg
             if generation != self._parse_generation:
                 return
+            target = record.get("replace_layer")
+            if target is not None:
+                if target in self.layers:
+                    target.data = target.raw_data = data
+                    target.parse_options = record["parse_options"]
+                    factor = target.scale_factor
+                    target.scale_factor = 1.
+                    if factor != 1.:
+                        target.apply_scale(factor)
+                    data["_role"] = target.role
+                    self._invalidate(target)
+                    self._recompute_view_bbox()
+                return
             # 批量导入时先不进 Treeview, 等 parse_done 一次性重建 (原来每层都重建整表)
             ly = self._add_layer_data(data, path, group, refresh=False,
                                       batch_size=batch_size)
             if record.get("restore"):
+                ly.parse_options = record.get("parse_options", {})
                 ly.name = record.get("name") or ly.name
                 ly.color = record.get("color") or ly.color
                 ly.visible = bool(record.get("visible", True))
@@ -808,6 +1004,8 @@ class GerberViewer:
                 ly.detail_pending = False
             self._schedule_render()
         elif t == "diff":
+            if msg[1] == self._diff_generation:
+                self._invalidate_changed_comparison()
             if msg[1] == self._diff_generation:
                 self._show_diff(msg[2])
 
@@ -1034,21 +1232,41 @@ class GerberViewer:
                 paths.append(p)
         return paths
 
-    def _compare_load(self, group):
-        paths = filedialog.askopenfilenames(
-            title=f"对比 {group}: 选择多层 Gerber/钻孔 (可多选; 取消则改为选目录)",
-            filetypes=[("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
-                       ("Gerber", _GERBER_PATTERNS),
-                       ("钻孔 NC Drill", _DRILL_PATTERNS),
-                       ("All files", "*.*")])
-        if not paths:
-            d = filedialog.askdirectory(title=f"对比 {group}: 选择包含多层的目录")
-            if d:
-                paths = self._gather_dir(d)
+    def _compare_load(self, group, directory=False):
+        if directory:
+            d = filedialog.askdirectory(parent=self.win, title=f"对比 {group}: 选择包含多层的目录")
+            paths = self._gather_dir(d) if d else []
+        else:
+            paths = filedialog.askopenfilenames(
+                parent=self.win, title=f"对比 {group}: 选择多层 Gerber/钻孔 (可多选)",
+                filetypes=[("Gerber/钻孔 (自动识别, 含无后缀)", "*"),
+                           ("Gerber/钻孔 (常用格式)", _GERBER_PATTERNS + " " + _DRILL_PATTERNS),
+                           ("Gerber", _GERBER_PATTERNS),
+                           ("钻孔 NC Drill", _DRILL_PATTERNS),
+                           ("All files", "*.*")])
         if not paths:
             return
         self._enqueue_parse(paths, group=group, do_fit=True)
-        self.info.set(f"对比模式: 已载入 {group} 组 {len(paths)} 层 — 载入 A、B 后点『自动定位差异』")
+        self.info.set(f"对比模式: 正在导入 {group} 组 {len(paths)} 个文件 — 两组完成后点『自动定位差异』")
+
+    def _update_compare_summary(self):
+        counts = []
+        for group in ("A", "B"):
+            layers = [ly for ly in self.layers if ly.group == group]
+            counts.append(f"{group}组 {len(layers)} 层 (可见 {sum(ly.visible for ly in layers)})")
+        self.compare_summary.set("\n".join(counts) + "\n仅比较可见图层，普通导入不参与对比")
+        if hasattr(self, "_layer_summary"):
+            self._layer_summary.set(f"{len(self.layers)} 个图层 · {sum(self._layer_on(l) for l in self.layers)} 个显示")
+
+    def _view_diff_results(self):
+        self._invalidate_changed_comparison()
+        if self.diff_result is None:
+            messagebox.showinfo("A/B 对比", "请先导入 A、B 两组，再点击『自动定位差异』。", parent=self.win)
+            return
+        if self.diff_result["total"] == 0:
+            messagebox.showinfo("A/B 对比", "上次对比在指定精度与容差下未发现差异。", parent=self.win)
+            return
+        self._open_diff_window(self.diff_result)
 
     def _drop_layer_refs(self, removed=None):
         """断开 Solo / 网络高亮对已删除图层对象的引用。
@@ -1079,10 +1297,19 @@ class GerberViewer:
         self.selected = None
         self.diff_points = []
         self.diff_result = None
+        self._diff_source_signature = None
+        for window in getattr(self, "_diff_windows", []):
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self._diff_windows = []
         self._group_idx = {"A": 0, "B": 0}
         self._batch = 0
         self._measure_pts = []
         self._measure_cur = None
+        self._measure_features = []
+        self._measure_hover = None
         self._recompute_view_bbox()
         self._refresh_list()
         self._schedule_render()
@@ -1139,7 +1366,8 @@ class GerberViewer:
         lines = [f"导入失败: {name} — {error}" for name, error in self._parse_errors]
         for layer in self.layers:
             lines.append(f"{layer.name}: 比例 ×{layer.scale_factor:g}, 偏移 {layer.offset}, 镜像 {layer.mirror_x}")
-            lines.extend("  " + str(w) for w in (layer.data.get("warnings") or []))
+            lines.extend("  警告: " + str(w) for w in (layer.data.get("warnings") or []))
+            lines.extend("  信息: " + str(n) for n in (layer.data.get("notes") or []))
         messagebox.showinfo("解析与变换信息", "\n".join(lines) if lines else "暂无问题", parent=self.win)
 
     def _manufacturing_report(self):
@@ -1166,6 +1394,7 @@ class GerberViewer:
 
     def _export_diff_csv(self):
         from gerber_report import write_diff_csv
+        self._invalidate_changed_comparison()
         if not self.diff_result:
             messagebox.showinfo("导出差异", "请先计算 A/B 差异", parent=self.win)
             return
@@ -1180,6 +1409,8 @@ class GerberViewer:
 
     def _refresh_list(self):
         self.tree.delete(*self.tree.get_children())
+        self._color_swatches.clear()
+        size = max(12, int(14 * self._ui_scale()))
         for i, ly in enumerate(self.layers):
             mark = "■" if ly.visible else "□"
             tag = ly.color if ly.visible else "off"
@@ -1188,12 +1419,17 @@ class GerberViewer:
                     self.tree.tag_configure(ly.color, foreground=ly.color)
                 except Exception:
                     pass
-            self.tree.insert("", tk.END, iid=str(i),
+            swatch = tk.PhotoImage(master=self.tree, width=size, height=size)
+            swatch.put(ly.color, to=(0, 0, size, size))
+            self._color_swatches[str(i)] = swatch
+            self.tree.insert("", tk.END, iid=str(i), image=swatch,
                              values=(mark,
                                      ly.name + (" ⚠" if (ly.data or {}).get("warnings") else ""),
                                      ly.type_label(), ly.unit_label()),
                              tags=(tag,))
         self._sync_selection()
+        self._update_compare_summary()
+        self._update_layer_details()
 
     def _on_tree_click(self, event):
         row = self.tree.identify_row(event.y)
@@ -1201,6 +1437,11 @@ class GerberViewer:
         if not row:
             return
         mods = event.state & 0x0005
+        if col == "#0" and not mods:
+            self.selected = int(row)
+            self._sync_selection()
+            self._pick_color()
+            return "break"
         if col == "#1" and not mods:
             i = int(row)
             self._toggle_visible(i)
@@ -1211,15 +1452,17 @@ class GerberViewer:
         if not row:
             return
         col = self.tree.identify_column(event.x)
-        if col == "#1":
-            self._toggle_visible(int(row))
-        else:
+        if col in ("#0", "#1"):
+            # 第一次单击已改色/切换, 不在双击事件中重复执行。
+            return "break"
+        if col == "#2":
             self.selected = int(row)
             self._sync_selection()
             self._pick_color()
+            return "break"
 
     def _pick_color(self):
-        """修改选中图层颜色 (KiCad 风格: 双击图层名或点『改颜色』)"""
+        """修改选中图层颜色: 左键单击色块, 或双击图层名。"""
         ly = self._sel_layer()
         if ly is None:
             self.info.set("请先在左侧列表中选中一个图层, 再修改颜色")
@@ -1259,7 +1502,7 @@ class GerberViewer:
             self.selected = int(sel[0])
             ly = self._sel_layer()
             if ly is not None:
-                self.info.set(ly.detail_text()[:200])
+                self._update_layer_details()
             self._schedule_render()
 
     def _sync_selection(self):
@@ -1439,14 +1682,14 @@ class GerberViewer:
         if not A or not B:
             return
         def grp_bbox(ls):
-            bs = [l.local_bbox() for l in ls]
+            bs = [l.bbox() for l in ls]
             return (min(b[0] for b in bs), min(b[1] for b in bs),
                     max(b[2] for b in bs), max(b[3] for b in bs))
         ab = grp_bbox(A); bb = grp_bbox(B)
         dx = (ab[0] + ab[2]) / 2 - (bb[0] + bb[2]) / 2
         dy = (ab[1] + ab[3]) / 2 - (bb[1] + bb[3]) / 2
         for l in B:
-            l.offset = [dx, dy]
+            l.offset = [l.offset[0] + dx, l.offset[1] + dy]
         self._recompute_view_bbox()
         self._last_img = None
         self._schedule_render()
@@ -1587,6 +1830,8 @@ class GerberViewer:
             self._after_scale(changed, "；".join(msgs))
         elif report and msgs:
             self.info.set("；".join(msgs)[:200])
+        elif report:
+            self.info.set("未发现常见单位/格式倍数异常；图幅一致不代表几何数据相同")
         return msgs
 
     # ---------------- 变换 ----------------
@@ -1698,6 +1943,10 @@ class GerberViewer:
         self._schedule_settle()
 
     def _schedule_render(self):
+        self._invalidate_changed_comparison()
+        signature = getattr(self, "_measure_source_signature", None)
+        if signature is not None and signature != self._measurement_signature():
+            self._measure_mode_changed()
         if self._render_job is not None:
             return
         try:
@@ -1759,12 +2008,29 @@ class GerberViewer:
             self._drag["ox"], self._drag["oy"] = ly.offset
 
     def _on_motion_measure(self, event):
-        if not self._measure_on or not self._measure_pts:
+        if not self._measure_on:
             return
-        self._measure_cur = self._canvas_to_mm(event.x, event.y)
+        limit = 3 if self._measure_mode.get() == "自由点/夹角" else 2
+        if len(self._measure_pts) >= limit:
+            self._measure_hover = None
+            self._measure_cur = None
+            self._refresh_measure()
+            return
+        x, y = self._canvas_to_mm(event.x, event.y)
+        mode = self._measure_mode.get()
+        edge = mode == "边到边" or (mode == "中心到边" and bool(self._measure_features))
+        feature = self._pick_measure_feature(x, y, edge=edge, pads_only=mode == "自由点/夹角")
+        self._measure_hover = feature
+        if mode == "自由点/夹角":
+            self._measure_cur = self._snap_point(x, y) if self._snap_var.get() else (x, y)
+        else:
+            self._measure_cur = (feature.boundary((x, y)) if edge else feature.center) if feature else None
         self._refresh_measure()
 
     def _on_motion(self, event):
+        if self._drag and self._drag["mode"] == "pan":
+            self._pan_move(event)
+            return
         if not self._drag or self._drag["mode"] != "layer":
             return
         ly = self._sel_layer()
@@ -1785,6 +2051,7 @@ class GerberViewer:
             self._drag_above = None
             self._drag_bg_key = None
             self._recompute_view_bbox()
+            self._update_layer_details()
             self._schedule_settle()
 
     def _pan_start(self, event):
@@ -1813,7 +2080,15 @@ class GerberViewer:
         if not self._hover_xy:
             return
         x, y = self._canvas_to_mm(*self._hover_xy)
-        self.status.set(f"X={x:.3f}mm  Y={y:.3f}mm   (mil: {x*39.3701:.1f} x {y*39.3701:.1f})")
+        if hasattr(self, "_coordinates"):
+            self._coordinates.set(f"X {x:+.3f}    Y {y:+.3f}    mm")
+        if self._measure_on:
+            feature = getattr(self, "_measure_hover", None)
+            if feature:
+                self.status.set(feature.label)
+            return
+        # Coordinates have their own fixed-width field; do not erase operation
+        # messages or comparison results on every mouse move.
 
     # ---------------- 位图缓存请求 ----------------
     def _viewport_world(self, pad=0.12):
@@ -1841,6 +2116,8 @@ class GerberViewer:
         lb = ly.local_bbox()
         if not lb:
             return None
+        if ly.mirror_x:
+            lb = [-lb[2], lb[1], -lb[0], lb[3]]
         try:
             ly.index = _GridIndex(store, data, lb)
             ly.index_sig = sig
@@ -2066,6 +2343,10 @@ class GerberViewer:
                         if clip is not None and _outside(pts, clip, wpx + 2):
                             continue
                         draw.line(pts, fill=c, width=wpx, joint="curve")
+                        if wd > 0:
+                            r = wd * scale / 2
+                            for cx, cy in (pts[0], pts[-1]):
+                                draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=c)
                 elif t == 3:                               # region
                     e = extras.get(i)
                     pl = e[0] if e else None
@@ -2105,6 +2386,11 @@ class GerberViewer:
                             or min(a[1], bb[1]) - wpx > clip[3]):
                         continue
                     draw.line([a, bb], fill=c, width=wpx)
+                    aperture = (data.get("apertures") or {}).get(ap) or {}
+                    if wd > 0 and aperture.get("shape", "C") == "C":
+                        r = wd * scale / 2
+                        for cx, cy in (a, bb):
+                            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=c)
         if kind == "drill":
             for hd in (data.get("holes") or []):
                 if hd.get("x") is None:
@@ -2112,8 +2398,9 @@ class GerberViewer:
                 cx, cy = T(hd["x"], hd["y"])
                 dia = hd.get("diameter_mm") or 0.3
                 r = max(0.7, dia / 2 * scale)
-                if clip is not None and (cx + r < clip[0] or cx - r > clip[2]
-                                         or cy + r < clip[1] or cy - r > clip[3]):
+                ex, ey = T(hd["x2"], hd["y2"]) if hd.get("is_slot") and hd.get("x2") is not None and hd.get("y2") is not None else (cx, cy)
+                if clip is not None and (max(cx, ex) + r < clip[0] or min(cx, ex) - r > clip[2]
+                                         or max(cy, ey) + r < clip[1] or min(cy, ey) - r > clip[3]):
                     continue
                 if hd.get("is_slot") and hd.get("x2") is not None and hd.get("y2") is not None:
                     ex, ey = T(hd["x2"], hd["y2"])
@@ -2159,7 +2446,8 @@ class GerberViewer:
         clip = None if clamp else (0.0, 0.0, float(dw), float(dh))
         sel = indices
         if sel is None and index is not None:
-            sel = index.query(lb[0], lb[1], lb[2], lb[3])
+            query_box = (-lb[2], lb[1], -lb[0], lb[3]) if mirror else lb
+            sel = index.query(*query_box)
         ok = self._draw_prims(draw, data, kind, T, scale * ss, 255, 0,
                               ap_cache={}, clip=clip, indices=sel,
                               should_abort=should_abort)
@@ -2221,9 +2509,9 @@ class GerberViewer:
         if self._hl and not (self._interactive and self._fast_preview):
             self._draw_highlight(canvas_img, W, H)
         d = ImageDraw.Draw(canvas_img)
-        if sel is not None and self._layer_on(sel):
+        if sel is not None and self._layer_on(sel) and (self._bounds_var.get() or self.move_mode.get()):
             self._draw_sel_rect(d, sel)
-        if self.diff_points:
+        if self.diff_points and self._markers_var.get():
             self._draw_diff_markers(d)
         if self._photo is None or self._photo.width() != W or self._photo.height() != H:
             self._photo = ImageTk.PhotoImage(canvas_img)
@@ -2241,9 +2529,24 @@ class GerberViewer:
         self._frame_scale = None
         self._evict_cache()
         self._refresh_measure()
+        self._refresh_canvas_chrome(W, H)
         self._frame_img = canvas_img      # 供调试/回归取最终帧 (含高亮)
         if any_pending:
             self.status.set("渲染中 ... (后台)")
+
+    def _refresh_canvas_chrome(self, width, height):
+        visible = sum(self._layer_on(l) for l in self.layers)
+        self._view_summary.set(f"画布 · {visible}/{len(self.layers)} 层显示 · 缩放 {self.zoom:.2f}×"
+                               + (" · Solo" if self._solo is not None else ""))
+        self.canvas.delete("empty_state")
+        if not self.layers:
+            self.canvas.create_text(width / 2, height / 2 - 16, text="导入 Gerber，开始查看",
+                                    fill="#cbd5e1", font=("Microsoft YaHei UI", 17), tags="empty_state")
+            self.canvas.create_text(width / 2, height / 2 + 24, text="导入文件 / 文件夹  ·  A/B 对比  ·  几何量测",
+                                    fill="#64748b", font=("Microsoft YaHei UI", 10), tags="empty_state")
+        elif not visible:
+            self.canvas.create_text(width / 2, height / 2, text="当前图层已隐藏，可在图层面板开启",
+                                    fill="#94a3b8", font=("Microsoft YaHei UI", 12), tags="empty_state")
 
     def _canvas_world_rect(self, W, H):
         """画布 (0,0)-(W,H) 对应的世界坐标范围"""
@@ -2458,6 +2761,7 @@ class GerberViewer:
             self._solo = ly
             self.status.set(f"单层隔离: {ly.name} (再按一次 Solo 退出)")
         self._last_img = None
+        self._update_compare_summary()
         self._schedule_render()
 
     def _net_map(self, ly):
@@ -2497,6 +2801,8 @@ class GerberViewer:
 
     def _highlight_at(self, event):
         """双击: 高亮该点所在图元的整条网络"""
+        if self._measure_on:
+            return "break"
         x, y = self._canvas_to_mm(event.x, event.y)
         fallback = None                     # 最上面的命中 (无网络名时兜底)
         for ly in reversed(self.layers):
@@ -2567,6 +2873,10 @@ class GerberViewer:
             self._measure_var.set(False)
         self._measure_pts = []
         self._measure_cur = None
+        self._measure_features = []
+        self._measure_hover = None
+        if hasattr(self, "canvas"):
+            self.canvas.configure(cursor="fleur" if self.move_mode.get() else "")
         self._last_img = None
         self._refresh_measure()
         self._schedule_render()
@@ -2576,65 +2886,148 @@ class GerberViewer:
     def _measure_toggle(self):
         self._measure_on = not self._measure_on
         self._measure_var.set(self._measure_on)
-        self._measure_pts = []
-        self._measure_cur = None
-        self._refresh_measure()
+        self._measure_mode_changed()
         if self._measure_on:
-            self.status.set("测距: 左键点第 1 点, 第 2 点得到距离/角度, 第 3 点测夹角; Esc 退出")
+            self.move_mode.set(False)
+            self._drag = None
+            self._show_panel("measure")
+            self.canvas.configure(cursor="crosshair")
+            self.status.set("量测: 选择方式后点选两个图元；自由点模式第三点测夹角；Esc 退出")
         else:
+            self.canvas.configure(cursor="")
             self.status.set("测距已关闭")
 
     def _measure_click(self, event):
-        if len(self._measure_pts) >= 3:
-            self._measure_pts = []
+        mode = self._measure_mode.get()
+        limit = 3 if mode == "自由点/夹角" else 2
+        if len(self._measure_pts) >= limit:
+            self._measure_mode_changed()
         x, y = self._canvas_to_mm(event.x, event.y)
-        self._last_snap_info = ""
-        if self._snap_var.get():
-            x, y = self._snap_point(x, y)
-        if getattr(self, "_last_snap_info", ""):
-            self.status.set(self._last_snap_info)
-        self._measure_pts.append((x, y))
+        if mode == "自由点/夹角":
+            if self._snap_var.get():
+                x, y = self._snap_point(x, y)
+            self._measure_pts.append((x, y))
+        else:
+            edge = mode == "边到边" or (mode == "中心到边" and bool(self._measure_features))
+            feature = self._pick_measure_feature(x, y, edge=edge)
+            if feature is None:
+                self.status.set("未抓取到图形，此点不计入量测；请靠近可见图元")
+                return
+            if self._measure_features and feature.key == self._measure_features[0].key:
+                self.status.set("请选择另一个图元；测单个图形可使用自由点模式")
+                return
+            self._measure_features.append(feature)
+            self._measure_pts.append(feature.center)
+            if len(self._measure_features) == 2:
+                self._measure_pts = list(self._feature_measure_pair(*self._measure_features))
+            self.status.set(feature.label)
         self._measure_cur = None
+        self._measure_source_signature = self._measurement_signature()
+        self._refresh_measure()
+        if len(self._measure_pts) >= 2:
+            self.status.set(self._measure_text())
+
+    def _measure_mode_changed(self, _event=None):
+        self._measure_pts = []
+        self._measure_cur = None
+        self._measure_features = []
+        self._measure_hover = None
+        self._measure_source_signature = None
         self._refresh_measure()
 
-    def _snap_point(self, x, y):
-        """Snap to nearby flash/drill centres; preserve world coordinates."""
-        tol = 8.0 / max(self._sc()[0], 1e-9)
-        best, dist = (x, y), tol
-        self._last_snap_info = ""
-        for ly in self.layers:
+    def _measurement_signature(self):
+        return (id(self._solo), tuple((id(l), id(l.data), l.visible, tuple(l.offset), l.mirror_x)
+                                     for l in self.layers))
+
+    def _feature_measure_pair(self, a, b):
+        from gerber_measure import nearest_features
+        mode = self._measure_mode.get()
+        if mode == "边到边":
+            return nearest_features(a, b)
+        if mode == "中心到边":
+            return a.center, b.boundary(a.center)
+        return a.center, b.center
+
+    def _pick_measure_feature(self, x, y, edge=False, pads_only=False):
+        from gerber_measure import primitive_feature, hole_feature, distance
+        tol = 8.0 * self._ui_scale() / max(self._sc()[0], 1e-9)
+        best, score = None, None
+        for ly in reversed(self.layers):
             if not self._layer_on(ly):
                 continue
             ox, oy = ly.offset
-            lx = x - ox
-            if ly.mirror_x:
-                lx = -lx
-            ly_y = y - oy
+            lx, ly_y = (-1 if ly.mirror_x else 1) * (x - ox), y - oy
             store = (ly.data or {}).get("primitives")
+            candidates = []
             if store is not None:
                 idx = self._layer_index(ly)
-                candidates = idx.query(lx - tol, ly_y - tol, lx + tol, ly_y + tol) if idx else None
-                for i in (range(store.n) if candidates is None else candidates):
+                ids = idx.query(lx - tol, ly_y - tol, lx + tol, ly_y + tol) if idx else None
+                for i in (range(store.n) if ids is None else ids):
                     b = i * 9
-                    if int(store.rec[b]) & 7 != 1:
-                        continue
-                    px, py = store.rec[b + 1], store.rec[b + 2]
-                    d = math.hypot(px - lx, py - ly_y)
-                    if d < dist:
-                        dist, best = d, ((-px if ly.mirror_x else px) + ox, py + oy)
-                        shape, fw, fh, _, _ = self._ap_shape_data(ly.data, int(store.rec[b + 6]), store.rec[b + 5])
-                        self._last_snap_info = f"{ly.name}: 焊盘中心，{shape} {fw:.4f}×{fh:.4f} mm"
-            for hole in (ly.data or {}).get("holes") or []:
+                    # Cheap bounds check before constructing region/arc geometry.
+                    bb = _prim_bbox(store.rec, b, store.extras, i, self._measure_ap_sizes(ly))
+                    if bb and bb[0] - tol <= lx <= bb[2] + tol and bb[1] - tol <= ly_y <= bb[3] + tol:
+                        f = primitive_feature(self, ly, i)
+                        if f is not None and (edge or (not int(store.rec[b]) & 8 and
+                                                      (not pads_only or int(store.rec[b]) & 7 == 1))):
+                            candidates.append(f)
+            for i, hole in enumerate((ly.data or {}).get("holes") or []):
                 if hole.get("x") is None or hole.get("y") is None:
                     continue
-                d = math.hypot(hole["x"] - lx, hole["y"] - ly_y)
-                if d < dist:
-                    dist, best = d, ((-hole["x"] if ly.mirror_x else hole["x"]) + ox, hole["y"] + oy)
-                    self._last_snap_info = f"{ly.name}: 孔中心，孔径 {hole.get('diameter_mm') or '未知'} mm"
+                r = (hole.get("diameter_mm") or 0) / 2 + tol
+                x2, y2 = hole.get("x2", hole["x"]), hole.get("y2", hole["y"])
+                x2 = hole["x"] if x2 is None else x2
+                y2 = hole["y"] if y2 is None else y2
+                if min(hole["x"], x2) - r <= lx <= max(hole["x"], x2) + r and min(hole["y"], y2) - r <= ly_y <= max(hole["y"], y2) + r:
+                    f = hole_feature(ly, i)
+                    if f is not None:
+                        candidates.append(f)
+            for f in reversed(candidates):
+                d = f.pick_distance((x, y))
+                if d > tol:
+                    continue
+                # Edge mode selects nearest contour; centre mode accepts a click
+                # anywhere inside a pad, with centre distance resolving overlaps.
+                rank = (distance((x, y), f.boundary((x, y))) if edge else d,
+                        distance((x, y), f.center))
+                if score is None or rank < score:
+                    best, score = f, rank
         return best
+
+    def _measure_ap_sizes(self, ly):
+        if getattr(ly, "_measure_ap_data", None) is not ly.data:
+            ly._measure_ap_data = ly.data
+            ly._measure_ap_max = {code: max(self._ap_shape_data(ly.data, code, .2)[1:3])
+                                  for code in (ly.data.get("apertures") or {})}
+        return ly._measure_ap_max
+
+    def _snap_point(self, x, y):
+        """Centre snap accepts the pad body, including large pads and slots."""
+        self._last_snap_info = ""
+        feature = self._pick_measure_feature(x, y, pads_only=True)
+        if feature:
+            self._last_snap_info = feature.label + "（中心）"
+            return feature.center
+        return x, y
+
+    def _measure_display_points(self):
+        pts = list(self._measure_pts)
+        mode = self._measure_mode.get() if hasattr(self, "_measure_mode") else "自由点/夹角"
+        limit = 3 if mode == "自由点/夹角" else 2
+        if self._measure_on and len(pts) < limit:
+            features = getattr(self, "_measure_features", [])
+            hover = getattr(self, "_measure_hover", None)
+            if mode != "自由点/夹角" and len(features) == 1 and hover and features[0].key != hover.key:
+                pts = list(self._feature_measure_pair(features[0], hover))
+            elif self._measure_cur is not None and (mode == "自由点/夹角" or not pts):
+                pts.append(self._measure_cur)
+        return pts
 
     def _refresh_measure(self):
         """用 Tk 画布对象画测距线和读数 (避免每次鼠标移动都重绘整幅位图)"""
+        txt = self._measure_text()
+        if hasattr(self, "_measure_readout"):
+            self._measure_readout.set(txt or ("点选第一个图元" if self._measure_on else "尚未量测"))
         cv = getattr(self, "canvas", None)
         if cv is None or not hasattr(cv, "delete"):
             return
@@ -2642,31 +3035,71 @@ class GerberViewer:
             cv.delete("measure")
             if not self._measure_on and not self._measure_pts:
                 return
-            pts = [self._to_canvas(x, y) for x, y in self._measure_pts]
-            if self._measure_on and self._measure_cur and pts:
-                pts.append(self._to_canvas(*self._measure_cur))
+            features = list(getattr(self, "_measure_features", []))
+            hover = getattr(self, "_measure_hover", None)
+            if hover and not any(f.key == hover.key for f in features):
+                features.append(hover)
+            for f in features:
+                color = "#ffd60a" if hover is f else "#00e5ff"
+                # Show what was grabbed without re-rendering the Gerber bitmap.
+                cx, cy = self._to_canvas(*f.center)
+                cv.create_line(cx - 6, cy, cx + 6, cy, fill=color, tags="measure")
+                cv.create_line(cx, cy - 6, cx, cy + 6, fill=color, tags="measure")
+                if len(f.paths) == 1 and len(f.paths[0]) == 1 and f.radius:
+                    r = f.radius * self._sc()[0]
+                    cv.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, tags="measure")
+                else:
+                    for path in f.paths:
+                        points = list(path)
+                        if f.filled and points and points[0] != points[-1]:
+                            points.append(points[0])
+                        if len(points) > 1:
+                            cv.create_line(*[value for p in points for value in self._to_canvas(*p)],
+                                           fill=color, dash=(3, 3), tags="measure")
+            pts = [self._to_canvas(x, y) for x, y in self._measure_display_points()]
             for (ax, ay), (bx, by) in zip(pts, pts[1:]):
                 cv.create_line(ax, ay, bx, by, fill="#00e5ff", width=2, tags="measure")
             for (ax, ay) in pts:
                 cv.create_oval(ax - 3, ay - 3, ax + 3, ay + 3,
                                outline="#00e5ff", width=2, tags="measure")
-            txt = self._measure_text()
-            if txt:
+            if txt and pts:
                 ax, ay = pts[-1]
-                cv.create_text(ax + 12, ay + 12, text=txt, anchor="nw", tags="measure",
-                               fill="#00e5ff", font=("Consolas", 10, "bold"))
+                # A compact distance badge on canvas; full data stays in the
+                # sidebar so long labels never obscure the board.
+                from gerber_measure import distance
+                world = self._measure_display_points()
+                label = f"{distance(world[0], world[1]):.4f} mm"
+                item = cv.create_text(ax + 12, ay + 12, text=label, anchor="nw", tags=("measure", "measure_label"),
+                                      fill="#e2faff", font=("Consolas", 10, "bold"))
+                box = cv.bbox(item)
+                if box:
+                    w, h = cv.winfo_width(), cv.winfo_height()
+                    dx = max(6 - box[0], min(0, w - 6 - box[2]))
+                    dy = max(6 - box[1], min(0, h - 6 - box[3]))
+                    cv.move(item, dx, dy)
+                    box = cv.bbox(item)
+                    background = cv.create_rectangle(box[0] - 4, box[1] - 3, box[2] + 4, box[3] + 3,
+                                                     fill="#17252e", outline="#355461", tags=("measure", "measure_label"))
+                    cv.tag_lower(background, item)
         except Exception:                # noqa: BLE001
             pass
 
     def _measure_text(self):
-        p = self._measure_pts
+        p = self._measure_display_points()
         if len(p) < 2:
             return ""
         (x1, y1), (x2, y2) = p[0], p[1]
         dx, dy = x2 - x1, y2 - y1
         dist = math.hypot(dx, dy)
         ang = math.degrees(math.atan2(dy, dx))
-        s = f"{dist:.3f} mm   dx={dx:+.3f}  dy={dy:+.3f}   {ang:.2f}deg"
+        mode = self._measure_mode.get() if hasattr(self, "_measure_mode") else "自由点/夹角"
+        s = f"{mode}: {dist:.4f} mm ({dist / .0254:.2f} mil)\ndx={dx:+.4f}  dy={dy:+.4f}   {ang:.2f}deg"
+        features = list(getattr(self, "_measure_features", []))
+        hover = getattr(self, "_measure_hover", None)
+        if len(features) == 1 and hover:
+            features.append(hover)
+        if any(f.approximate for f in features):
+            s += "\n含近似图元，请核对；圆弧目标弦高 0.001 mm（分段有上限）"
         if len(p) >= 3:
             (x3, y3) = p[2]
             v1 = (x1 - x2, y1 - y2)
@@ -2697,11 +3130,101 @@ class GerberViewer:
                 x0, y0 = self._to_canvas(dp["bx0"], dp["by1"])
                 x1, y1 = self._to_canvas(dp["bx1"], dp["by0"])
                 d.rectangle([x0, y0, x1, y1], outline=col, width=2)
-            d.ellipse([x - r, y - r, x + r, y + r], outline=col, width=2)
-            d.line([x - r, y, x + r, y], fill=col, width=1)
-            d.line([x, y - r, x, y + r], fill=col, width=1)
+            else:
+                d.ellipse([x - r, y - r, x + r, y + r], outline=col, width=2)
 
     # ---------------- 自动差异定位 ----------------
+    def _comparison_signature(self):
+        return tuple((id(l), id(l.data), l.group, l.visible, tuple(l.offset), l.mirror_x,
+                      tuple(sorted((l.role or {}).items()))) for l in self.layers if l.group in ("A", "B"))
+
+    def _invalidate_changed_comparison(self):
+        signature = getattr(self, "_diff_source_signature", None)
+        if signature is not None and signature != self._comparison_signature():
+            self._diff_source_signature = None
+            self._diff_generation += 1
+            self._diff_cancel.set()
+            self.diff_result = None
+            self.diff_points = []
+            self._last_img = None
+            for window in getattr(self, "_diff_windows", []):
+                try:
+                    window.destroy()
+                except tk.TclError:
+                    pass
+            self._diff_windows = []
+            self.status.set("对比图层或变换已更改，旧结果已失效，请重新计算差异")
+
+    def _legacy_parameters(self):
+        from gerber_reader import parse_aperture_table
+        ly = self._sel_layer()
+        if ly is None or ly.kind != "gerber":
+            messagebox.showinfo("Gerber 参数", "请先选中一个 Gerber 图层。", parent=self.win)
+            return
+        win = tk.Toplevel(self.win)
+        win.title(win_title("RS-274D / Gerber 解析参数 — " + ly.name))
+        win.geometry("650x530")
+        unit = tk.StringVar(value=ly.raw_data.get("unit") or "mm")
+        fmt = tk.StringVar(value=ly.raw_data.get("format") or "3.3")
+        zero = tk.StringVar(value=ly.raw_data.get("zero_mode") or "L")
+        options = ttk.Frame(win, padding=8)
+        options.pack(fill=tk.X)
+        for title, var, values in (("源文件单位", unit, ("mm", "inch")),
+                                   ("整数位.小数位", fmt, ("2.4", "2.5", "3.3", "3.4", "3.5", "4.4")),
+                                   ("零省略 L=前导 T=尾随", zero, ("L", "T"))):
+            ttk.Label(options, text=title).pack(anchor=tk.W)
+            ttk.Combobox(options, textvariable=var, values=values, width=24,
+                         state="normal" if var is fmt else "readonly").pack(anchor=tk.W)
+        ttk.Label(win, text="光圈表（尺寸为上方源文件单位；# 开头为注释）\n"
+                           "D10 C 0.2   /   D11 R 1.0 0.5   /   D12 O 1.5 0.6\n"
+                           "每行一个光圈，支持 C/R/O/P；未知 CAM 表格式需转换，不自动猜测。",
+                  padding=8).pack(anchor=tk.W)
+        text = tk.Text(win, height=10, wrap="none")
+        text.pack(fill=tk.BOTH, expand=True, padx=8)
+        for code, ap in sorted((ly.raw_data.get("apertures") or {}).items()):
+            if ap.get("shape") in ("C", "R", "O", "P") and not ap.get("macro"):
+                text.insert(tk.END, f"D{code} {ap['shape']} " + " ".join(str(v) for v in ap.get("params", [])) + "\n")
+        actions = ttk.Frame(win, padding=8)
+        actions.pack(fill=tk.X)
+
+        def import_table():
+            path = filedialog.askopenfilename(parent=win, title="载入转换后的光圈表", filetypes=[("光圈表", "*.txt *.apr *.apt"), ("所有文件", "*")])
+            if path:
+                try:
+                    with open(path, encoding="utf-8-sig") as f:
+                        content = f.read()
+                    parse_aperture_table(content)
+                    text.delete("1.0", tk.END)
+                    text.insert("1.0", content)
+                except (OSError, ValueError) as exc:
+                    messagebox.showerror("光圈表读取失败", str(exc), parent=win)
+
+        def apply():
+            try:
+                digits = tuple(int(v) for v in fmt.get().split("."))
+                if len(digits) != 2 or not (1 <= digits[0] <= 7 and 0 <= digits[1] <= 7):
+                    raise ValueError("坐标格式例: 2.4；整数位 1..7，小数位 0..7")
+                table = parse_aperture_table(text.get("1.0", tk.END))
+                opts = {"unit_override": unit.get(), "format_override": digits,
+                        "zero_mode_override": zero.get(), "aperture_override": table}
+                if ly not in self.layers:
+                    raise ValueError("该图层已删除")
+                if self._batch:
+                    raise ValueError("请等待当前导入完成")
+            except ValueError as exc:
+                messagebox.showerror("参数无效", str(exc), parent=win)
+                return
+            self._cancel_diff()
+            self._batch = 1
+            self._batch_fit = False
+            record = {"path": ly.raw_data["file"], "replace_layer": ly, "parse_options": opts}
+            self._parse_q.put(([record], ly.group, self._parse_generation))
+            self.status.set("按指定单位/格式/光圈表重新解析: " + ly.name)
+            win.destroy()
+
+        ttk.Button(actions, text="载入光圈表文本", command=import_table).pack(side=tk.LEFT)
+        ttk.Button(actions, text="应用并重新解析", command=apply).pack(side=tk.RIGHT)
+
     def _auto_diff(self):
         from tkinter import simpledialog
         from gerber_diff import pair_layers
@@ -2710,8 +3233,21 @@ class GerberViewer:
         if not A or not B:
             messagebox.showinfo(
                 "自动定位差异",
-                "请先用『对比A: 导入多层』『对比B: 导入多层』分别载入 A、B 两组图层。\n"
-                "普通导入的图层不参与 A/B 对比。")
+                "请在上方『A/B 对比』栏分别导入 A、B 两组图层，并开启要比较的图层。\n"
+                "普通导入的图层不参与 A/B 对比。", parent=self.win)
+            return
+        if self._batch:
+            messagebox.showinfo("A/B 对比", "请等待导入/参数重解析完成后再对比。", parent=self.win)
+            return
+        invalid = [l.name for l in A + B if l.data.get("missing_apertures")]
+        if invalid:
+            messagebox.showwarning("缺少光圈表", "下列图层缺少光圈定义，不能可靠对比。\n"
+                                   "请选择图层并通过『RS-274D 参数』补充光圈、单位及格式。\n" +
+                                   "\n".join(invalid), parent=self.win)
+            return
+        risks = [l.name + ": " + l.warn_text() for l in A + B if l.warn_text()]
+        if risks and not messagebox.askyesno("对比前核对解析风险", "\n".join(risks) +
+                                              "\n\n仍按当前解析结果进行对比？", parent=self.win):
             return
         # Layer data and transforms must remain stable while a background
         # comparison is running, even if the user adjusts the view meanwhile.
@@ -2735,6 +3271,9 @@ class GerberViewer:
         if tolerance is None:
             return
         pairs, notes = pair_layers(A, B)
+        if notes and not messagebox.askyesno("核对图层配对", "\n".join(notes) + "\n\n继续比较？", parent=self.win):
+            return
+        notes.extend(risks)
         self._diff_cancel.set()
         self._diff_generation += 1
         self._diff_cancel.clear()
@@ -2742,6 +3281,15 @@ class GerberViewer:
                    "pairs": pairs, "notes": notes, "generation": self._diff_generation,
                    "namesA": [l.name for l in A], "namesB": [l.name for l in B]}
         self.status.set("正在计算 A/B 差异 ...")
+        for window in getattr(self, "_diff_windows", []):
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self._diff_windows = []
+        self.diff_result = None
+        self.diff_points = []
+        self._diff_source_signature = self._comparison_signature()
         self._render_q.put(("diff", payload))
 
     def _compute_diff(self, payload):
@@ -2753,9 +3301,23 @@ class GerberViewer:
             h = max(1, int(round((box[3] - box[1]) * scale)))
             if layer is None:
                 return Image.new("L", (w, h), 0)
-            img, _ = self._render_mask([(layer.data, layer.kind, layer.mirror_x,
-                                         tuple(layer.offset))], box, scale)
-            return img.crop((0, 0, w, h))
+            # Exact tile grid. The display mask has an extra row/column and
+            # shifts Y by one pixel; that must not affect comparison coordinates.
+            _, ImageDraw, _ = self._PIL()
+            img = Image.new("L", (w, h), 0)
+            ox, oy = layer.offset
+            def transform(x, y):
+                return (((-x if layer.mirror_x else x) + ox - box[0]) * scale,
+                        (box[3] - y - oy) * scale)
+            index = self._layer_index(layer)
+            local_box = (box[0] - ox, box[1] - oy, box[2] - ox, box[3] - oy)
+            if layer.mirror_x:
+                local_box = (-local_box[2], local_box[1], -local_box[0], local_box[3])
+            indices = index.query(*local_box) if index else None
+            self._draw_prims(ImageDraw.Draw(img), layer.data, layer.kind, transform, scale,
+                             255, 0, ap_cache={}, clip=(0, 0, w, h), indices=indices,
+                             should_abort=lambda: self._stop.is_set() or self._diff_cancel.is_set())
+            return img
 
         points = compare(payload["pairs"], payload["bbox"], payload["resolution"],
                          payload["tolerance"], render,
@@ -2857,6 +3419,8 @@ class GerberViewer:
 
     def _open_diff_window(self, res):
         win = tk.Toplevel(self.win)
+        self._diff_windows = [w for w in getattr(self, "_diff_windows", []) if w.winfo_exists()]
+        self._diff_windows.append(win)
         win.title(win_title("A/B 差异定位结果"))
         from win_dpi import apply_window
         apply_window(win, 760, 520)
@@ -2867,8 +3431,16 @@ class GerberViewer:
                   font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
         ttk.Button(head, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
 
+        # 先给底部操作留空间, 再让结果表填充剩余区域; 窄窗口可横向滚动。
+        foot = ttk.Frame(win, padding=6)
+        foot.pack(side=tk.BOTTOM, fill=tk.X)
+        actions = ttk.Frame(foot)
+        actions.pack(fill=tk.X)
+        table = ttk.Frame(win)
+        table.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
         cols = ("i", "layer", "side", "x", "y", "area", "cells")
-        tree = ttk.Treeview(win, columns=cols, show="headings", height=20)
+        tree = ttk.Treeview(table, columns=cols, show="headings", height=20)
         heads = {"i": "#", "layer": "配对图层", "side": "差异侧", "x": "X(mm)", "y": "Y(mm)",
                  "area": "差异面积mm²", "cells": "网格数"}
         widths = {"i": 50, "layer": 250, "side": 76, "x": 104, "y": 104, "area": 130, "cells": 80}
@@ -2877,10 +3449,14 @@ class GerberViewer:
             tree.column(c, width=widths[c], anchor=tk.CENTER)
         tree.tag_configure("A", foreground="#c0008a")
         tree.tag_configure("B", foreground="#0080a0")
-        vsb = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
-        vsb.pack(side=tk.LEFT, fill=tk.Y, pady=6)
+        vsb = ttk.Scrollbar(table, orient=tk.VERTICAL, command=tree.yview)
+        hsb = ttk.Scrollbar(table, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
         for i, dp in enumerate(res["points"], 1):
             tree.insert("", tk.END, iid=str(i - 1), values=(
                 i, dp.get("layer", ""), "A 多" if dp["side"] == "A" else "B 多",
@@ -2888,6 +3464,9 @@ class GerberViewer:
                 dp["area"], dp["cells"]), tags=(dp["side"],))
 
         def focus(_e=None):
+            self._invalidate_changed_comparison()
+            if self.diff_result is not res:
+                return
             s = tree.selection()
             if not s:
                 return
@@ -2896,14 +3475,13 @@ class GerberViewer:
             self.info.set(f"已定位差异: ({dp['x']:.3f}, {dp['y']:.3f}) {'A多' if dp['side']=='A' else 'B多'}")
 
         tree.bind("<Double-Button-1>", focus)
-        foot = ttk.Frame(win, padding=6)
-        foot.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Button(foot, text="定位选中(双击亦可)", command=focus).pack(side=tk.LEFT)
-        ttk.Button(foot, text="导出 CSV", command=self._export_diff_csv).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="定位选中(双击亦可)", command=focus).pack(side=tk.LEFT)
+        ttk.Button(actions, text="导出 CSV", command=self._export_diff_csv).pack(side=tk.LEFT, padx=4)
         if res.get("notes"):
-            ttk.Label(foot, text="；".join(res["notes"]), foreground="#a06000").pack(side=tk.LEFT)
+            ttk.Label(foot, text="；".join(res["notes"]), foreground="#a06000",
+                      wraplength=700).pack(anchor=tk.W)
         ttk.Label(foot, text="提示: 双击任一行可在版图中放大定位到该差异位置",
-                  foreground="#555").pack(side=tk.LEFT, padx=8)
+                  foreground="#555").pack(anchor=tk.W)
 
     # ---------------- 导出 ----------------
     def _export_png(self):

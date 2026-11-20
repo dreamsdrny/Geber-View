@@ -33,7 +33,7 @@ a = Analysis(
         'PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageTk', 'PIL.ImageFont',
         'PIL.ImageFilter',
         'gerber_viewer', 'gerber_reader', 'gerber_layer', 'win_dpi', 'branding',
-        'gerber_native', 'gerber_diff', 'gerber_project', 'gerber_report',
+        'gerber_native', 'gerber_diff', 'gerber_project', 'gerber_report', 'gerber_measure',
     ],
     hookspath=[],
     hooksconfig={},

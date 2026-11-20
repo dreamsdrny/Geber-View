@@ -22,7 +22,9 @@ def manufacturing(layers):
         else:
             lines.append(f"  图元: {data.get('feature_count', 0)}  最小线宽: {data.get('min_line_width_mm')} mm")
         for warning in data.get("warnings") or []:
-            lines.append("  提示: " + str(warning))
+            lines.append("  警告: " + str(warning))
+        for note in data.get("notes") or []:
+            lines.append("  信息: " + str(note))
         lines.append("")
     return "\n".join(lines)
 

@@ -6,6 +6,8 @@ import shutil
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tkinter as tk
@@ -155,6 +157,244 @@ def make_nets(path):
     io.open(path, 'w', encoding='ascii').write('\n'.join(L))
 
 
+def test_layer_controls(app, root):
+    """真实 Treeview 命中测试: 单击色块/开关, A/B 入口在窄窗口不被裁掉。"""
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+
+    buttons = [w for w in descendants(app.win) if w.winfo_class() == "TButton"]
+    check("toolbar color button removed", all(w.cget("text") != "改颜色" for w in buttons))
+    check("layer color column exists", app.tree.heading("#0")["text"] == "颜色")
+    names = {w.cget("text"): w for w in buttons}
+    controls = ("A组: 导入文件", "A组: 导入文件夹", "B组: 导入文件", "B组: 导入文件夹",
+                "自动定位差异", "查看差异结果", "导出差异CSV", "取消对比")
+    for width in (820, 1000, 1220):
+        app.win.geometry(f"{width}x780")
+        app._show_panel("compare")
+        root.update()
+        check(f"A/B panel visible at width {width}", all(
+            text in names and names[text].winfo_ismapped()
+            and names[text].winfo_rootx() >= app.win.winfo_rootx()
+            and names[text].winfo_rootx() + names[text].winfo_width()
+            <= app.win.winfo_rootx() + app.win.winfo_width()
+            for text in controls))
+        app._show_panel("layers")
+        root.update()
+        check(f"canvas has most of the height at width {width}",
+              app.canvas.winfo_height() >= app.win.winfo_height() * .78)
+        check(f"canvas has most of the width at width {width}",
+              app.canvas.winfo_width() >= app.win.winfo_width() * .55)
+
+    layer = app.layers[0]
+    app.selected = 0
+    app._refresh_list()
+    root.update()
+    x, y, w, h = app.tree.bbox("0", "#0")
+    event = type("E", (), {"x": x + w // 2, "y": y + h // 2, "state": 0})()
+    visible = layer.visible
+    with patch("tkinter.colorchooser.askcolor", return_value=((18, 52, 86), "#123456")) as chooser:
+        check("single color click consumes event", app._on_tree_click(event) == "break")
+        check("single color click changes correct layer", layer.color == "#123456"
+              and layer.visible == visible and chooser.call_count == 1)
+        app._on_tree_dbl(event)
+        check("color double click does not reopen chooser", chooser.call_count == 1)
+
+    root.update()
+    x, y, w, h = app.tree.bbox("0", "st")
+    event.x, event.y = x + w // 2, y + h // 2
+    with patch("tkinter.colorchooser.askcolor") as chooser:
+        app._on_tree_click(event)
+        check("visibility click does not open color dialog", layer.visible != visible and not chooser.called)
+        app._on_tree_dbl(event)
+        check("visibility double click does not toggle twice", layer.visible != visible)
+    root.update()
+    x, y, w, h = app.tree.bbox("0", "#0")
+    event.x, event.y = x + w // 2, y + h // 2
+    with patch("tkinter.colorchooser.askcolor", return_value=(None, None)) as chooser:
+        app._on_tree_click(event)
+        check("hidden layer color chooser and cancel", chooser.called
+              and layer.color == "#123456" and layer.visible != visible)
+    layer.visible = visible
+    # 正常解析信息不显示感叹号, 真正警告仍保留。
+    original = layer.data
+    layer.data = dict(original, warnings=[], notes=["已处理镜像"])
+    app._refresh_list()
+    check("information does not mark layer as warning", "⚠" not in app.tree.item("0", "values")[1])
+    layer.data = dict(original, warnings=["未支持的命令"])
+    app._refresh_list()
+    check("real warning remains visible", "⚠" in app.tree.item("0", "values")[1])
+    layer.data = original
+    app._refresh_list()
+
+    with patch.object(app, "_enqueue_parse") as enqueue, \
+            patch.object(gv.filedialog, "askopenfilenames", return_value=("top.gtl",)), \
+            patch.object(gv.filedialog, "askdirectory", return_value="board") as directory, \
+            patch.object(app, "_gather_dir", return_value=["bottom.gbl"]):
+        names["A组: 导入文件"].invoke()
+        check("A file import uses A group", enqueue.call_args.args[0] == ("top.gtl",)
+              and enqueue.call_args.kwargs["group"] == "A" and not directory.called)
+        names["B组: 导入文件夹"].invoke()
+        check("B folder import uses B group", enqueue.call_args.args[0] == ["bottom.gbl"]
+              and enqueue.call_args.kwargs["group"] == "B")
+    with patch.object(gv.filedialog, "askopenfilenames", return_value=()), \
+            patch.object(gv.filedialog, "askdirectory") as directory:
+        names["A组: 导入文件"].invoke()
+        check("cancel comparison import does not open another dialog", not directory.called)
+    groups = [ly.group for ly in app.layers]
+    app.layers[0].group = "A"
+    app.layers[1].group = "B"
+    app._refresh_list()
+
+    check("browse mode does not move layers by default", not app.move_mode.get())
+    check("selected layer bounds hidden by default", not app._bounds_var.get())
+    offset = list(app.layers[0].offset)
+    original_pan = list(app.pan)
+    app._on_press(SimpleNamespace(x=100, y=100))
+    app._on_motion(SimpleNamespace(x=120, y=110))
+    check("left drag pans in browse mode", app.pan == [original_pan[0] + 20, original_pan[1] + 10]
+          and app.layers[0].offset == offset)
+    app._on_release(None)
+    app.pan = original_pan
+    app.status.set("对比结果保留")
+    app._hover_xy = (50, 50)
+    app._flush_hover()
+    check("hover coordinates do not overwrite operation messages", app.status.get() == "对比结果保留"
+          and "X " in app._coordinates.get())
+    app.status.set("第一行\n第二行")
+    check("status bar remains a single line", app._status_display.get() == "第一行")
+    check("A/B panel reports imported layer counts", "A组 1 层" in app.compare_summary.get()
+          and "B组 1 层" in app.compare_summary.get())
+    for ly, group in zip(app.layers, groups):
+        ly.group = group
+    app._refresh_list()
+
+
+def test_compare_workflow(app, root, tmp):
+    """按钮 -> 异步差异计算 -> 结果列表 -> 再次查看, 使用小图层避免性能夹具干扰。"""
+    a = os.path.join(tmp, "a.gtl")
+    b = os.path.join(tmp, "b.gtl")
+    for path, x in ((a, 100000), (b, 120000)):
+        io.open(path, "w", encoding="ascii").write(
+            f"%FSLAX34Y34*%%MOMM*%%ADD10C,1.0*%D10*X{x}Y100000D03*M02*")
+    app._clear()
+    app._enqueue_parse([a], group="A")
+    app._enqueue_parse([b], group="B")
+    deadline = time.monotonic() + 10
+    while app._batch and time.monotonic() < deadline:
+        root.update()
+        time.sleep(.02)
+    check("A/B asynchronous imports finish with correct groups", app._batch == 0
+          and [ly.group for ly in app.layers] == ["A", "B"])
+    if app._batch or len(app.layers) != 2:
+        return
+    with patch("tkinter.simpledialog.askfloat", side_effect=[.05, 0.0]):
+        app._auto_diff()
+    deadline = time.monotonic() + 10
+    while app.diff_result is None and time.monotonic() < deadline:
+        root.update()
+        time.sleep(.02)
+    check("A/B background computation returns differences", app.diff_result is not None
+          and app.diff_result["total"] > 0)
+    windows = [w for w in app.win.winfo_children()
+               if isinstance(w, tk.Toplevel) and "差异定位结果" in w.title()]
+    check("A/B result interface opens", bool(windows))
+    for w in windows:
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        root.update()
+        trees = [child for child in descendants(w) if child.winfo_class() == "Treeview"]
+        check("A/B result interface lists difference rows", bool(trees) and bool(trees[0].get_children()))
+        buttons = [child for child in descendants(w) if child.winfo_class() == "TButton"]
+        check("A/B result action buttons visible", all(child.winfo_ismapped() and child.winfo_width() > 1
+              for child in buttons))
+        if trees and trees[0].get_children():
+            trees[0].selection_set(trees[0].get_children()[0])
+            with patch.object(app, "_focus_mm") as focus:
+                next(child for child in buttons if child.cget("text").startswith("定位选中")).invoke()
+                check("A/B selected difference locates on canvas", focus.called)
+        w.destroy()
+    if app.diff_result is not None:
+        app._view_diff_results()
+    windows = [w for w in app.win.winfo_children() if isinstance(w, tk.Toplevel)]
+    check("A/B results can be reopened", bool(windows))
+    for w in windows:
+        w.destroy()
+    app._clear()
+
+
+def test_measure_workflow(app, root, tmp):
+    """Actual canvas picking, preview and legacy parameter reparse."""
+    path = os.path.join(tmp, "measure.gtl")
+    io.open(path, "w", encoding="ascii").write(
+        "%FSLAX34Y34*%%MOMM*%%ADD10C,2*%D10*X00000Y00000D03*X50000Y00000D03*M02*")
+    app._clear()
+    app.add_layer(path)
+    app.fit()
+    root.update()
+    app._measure_var.set(True)
+    app._measure_toggle()
+    for mode, expected in (("中心到中心", 5.), ("边到边", 3.), ("中心到边", 4.)):
+        app._measure_mode.set(mode)
+        app._measure_mode_changed()
+        events = [SimpleNamespace(x=app._to_canvas(x, 0)[0], y=app._to_canvas(x, 0)[1]) for x in (0, 5)]
+        app._measure_click(events[0])
+        app._on_motion_measure(events[1])
+        check("measurement snap preview " + mode, f"{expected:.4f} mm" in app._measure_text())
+        check("measurement overlay drawn " + mode, bool(app.canvas.find_withtag("measure")))
+        app._measure_click(events[1])
+        check("measurement final value " + mode, f"{expected:.4f} mm" in app._measure_text())
+        check("measurement full readout stays in sidebar " + mode,
+              f"{expected:.4f} mm" in app._measure_readout.get() and "dx=" in app._measure_readout.get())
+        before = list(app._measure_pts)
+        app._on_motion_measure(SimpleNamespace(x=20, y=20))
+        check("completed measurement does not add hover clutter " + mode,
+              app._measure_pts == before and app._measure_hover is None)
+        app._on_motion_measure(events[1])
+        items = app.canvas.find_withtag("measure_label")
+        check("measurement badge only shows distance " + mode, any(
+              app.canvas.type(item) == "text" and app.canvas.itemcget(item, "text") == f"{expected:.4f} mm" for item in items))
+    app._clear_overlays()
+
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+
+    for width in (1000, 1220):
+        app.win.geometry(f"{width}x780")
+        root.update()
+        app._show_panel("measure")
+        root.update()
+        combo = app.measure_modes
+        check("measurement mode visible width " + str(width), combo.winfo_ismapped() and combo.winfo_rootx() + combo.winfo_width() <= app.win.winfo_rootx() + app.win.winfo_width())
+
+    old = os.path.join(tmp, "legacy.gtl")
+    io.open(old, "w", encoding="ascii").write("G71*D10*X010000Y020000D03*M02*")
+    app._clear()
+    app.add_layer(old)
+    ly = app.layers[-1]
+    check("legacy missing aperture flagged", ly.data.get("missing_apertures") == [10])
+    app._legacy_parameters()
+    win = next(w for w in app.win.winfo_children() if isinstance(w, tk.Toplevel))
+    combos = [w for w in descendants(win) if w.winfo_class() == "TCombobox"]
+    combos[0].set("mm"); combos[1].set("2.4"); combos[2].set("L")
+    text = next(w for w in descendants(win) if w.winfo_class() == "Text")
+    text.insert("1.0", "D10 C 1\n")
+    next(w for w in descendants(win) if w.winfo_class() == "TButton" and w.cget("text") == "应用并重新解析").invoke()
+    deadline = time.monotonic() + 10
+    while app._batch and time.monotonic() < deadline:
+        root.update()
+        time.sleep(.02)
+    check("legacy reparse replaces existing layer", app._batch == 0 and len(app.layers) == 1 and app.layers[0] is ly)
+    check("legacy coordinates and aperture repaired", ly.data["bbox"] == [1., 2., 1., 2.] and not ly.data.get("missing_apertures"))
+    check("legacy options retained for project", getattr(ly, "parse_options", {}).get("format_override") == (2, 4))
+    app._clear()
+
+
 def main():
     # 用独立的临时目录，跑完就删掉。不用 gettempdir() 直接落文件：
     # 在"低完整性"环境里（例如本工作区被打了 Low Mandatory Label）%TEMP% 不可写，
@@ -187,6 +427,7 @@ def main():
     root.update()
     print("add_layer %.0f ms" % ((time.time() - t) * 1000))
     print("layers", [ly.name for ly in app.layers])
+    test_layer_controls(app, root)
 
     app.fit()
     for _ in range(3):
@@ -380,6 +621,9 @@ def main():
             return im.tobytes()
 
         check("macro ap_cache diameters", render({}) == render(None))
+
+    test_compare_workflow(app, root, tmp)
+    test_measure_workflow(app, root, tmp)
 
     root.destroy()
     shutil.rmtree(tmp, ignore_errors=True)

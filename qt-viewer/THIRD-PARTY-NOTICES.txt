@@ -1,0 +1,16 @@
+Evan Gerber Qt/Rust migration prototype - third-party runtime notices
+
+Qt 6.8.3 Widgets
+- Qt runtime binaries and platform plugins are dynamically linked.
+- Qt is available under LGPL/GPL/commercial licensing. This prototype uses only the Qt Widgets, Gui, Core and Network runtime modules and Qt's Windows platform/style plugins; verify each actual binary's module/license metadata before redistribution.
+- Qt source and license materials must be included or provided using a compliant written offer; provide the applicable LGPL/GPL license texts and Qt modification/relink instructions when distributing.
+- Qt source archive: https://download.qt.io/archive/qt/6.8/6.8.3/single/qt-everywhere-src-6.8.3.zip
+
+MinGW-w64 13.1 runtime
+- Runtime DLLs are dynamically linked. Include the applicable GCC Runtime Library Exception, MinGW-w64, winpthreads, libstdc++ and libgcc notices/source as required by their licenses.
+- Toolchain license texts are installed under `.tools/Qt/Tools/mingw1310_64/licenses` on the development machine.
+
+Rust viewer_core
+- Linked as a separate DLL through the C ABI; license and corresponding source are in the repository.
+
+This file is a build-time checklist, not legal advice. Confirm exact DLLs, licenses, source availability, modification notices and relinking method against the generated deployment folder before external redistribution.

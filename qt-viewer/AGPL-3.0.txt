@@ -1,0 +1,7 @@
+The Evan Gerber Qt/Rust migration prototype is distributed under the GNU Affero General Public License version 3.0 or (at your option) any later version.
+
+The full license text is provided in the repository root file `LICENSE`.
+When redistributing this executable, include that complete license text and the corresponding source and build instructions.
+
+This prototype dynamically links Qt libraries distributed under their applicable LGPL/GPL and third-party licenses.
+See `THIRD-PARTY-NOTICES.txt` and the Qt source/license materials supplied alongside this package.
