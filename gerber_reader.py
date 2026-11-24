@@ -401,15 +401,35 @@ def _iter_gerber_commands(content: str):
 def _norm_macro_expr(expr: str) -> str:
     """Gerber 宏表达式 -> 可安全求值的 Python 表达式 ($n -> _vn, x -> *, = -> ==)"""
     s = re.sub(r"\$\s*(\d+)", lambda m: "_v" + m.group(1), str(expr or ""))
-    out = []
-    for c in s:
-        if c in "xX":
-            out.append("*")
-        elif c == "=":
-            out.append("==")
-        else:
-            out.append(c)
-    return "".join(out).strip()
+    s = re.sub(r"[xX]", "*", s)
+    # Gerber '=' 表相等 -> '=='; 但保留 <=, >=, !=, == 里已有的 '=' (旧版逐字符翻倍
+    # 会把 '>=' 变成 '>==' 导致语法错误, 回退把数字拼接成错误值)。
+    s = re.sub(r"(?<![<>!=])=(?!=)", "==", s)
+    return s.strip()
+
+
+_MACRO_AST_CACHE: "OrderedDict[str, object]" = OrderedDict()
+_MACRO_AST_LOCK = threading.Lock()
+_MACRO_AST_CACHE_MAX = 4096
+
+
+def _macro_ast(text: str):
+    """宏表达式 AST 缓存: 同一表达式 (如 '$1x2') 在大量闪装展开里反复出现,
+    缓存解析结果省去重复 ast.parse; 解析失败返回 None (走数字兜底)。AST 只读不改, 可跨调用复用。"""
+    with _MACRO_AST_LOCK:
+        node = _MACRO_AST_CACHE.get(text)
+        if node is not None:
+            _MACRO_AST_CACHE.move_to_end(text)
+            return node
+    try:
+        node = ast.parse(text, mode="eval")
+    except SyntaxError:
+        return None
+    with _MACRO_AST_LOCK:
+        if len(_MACRO_AST_CACHE) >= _MACRO_AST_CACHE_MAX:
+            _MACRO_AST_CACHE.popitem(last=False)
+        _MACRO_AST_CACHE[text] = node
+    return node
 
 
 def _macro_eval(expr, variables: Dict[str, float]) -> float:
@@ -419,9 +439,8 @@ def _macro_eval(expr, variables: Dict[str, float]) -> float:
     text = _norm_macro_expr(expr)
     if text == "":
         return 0.0
-    try:
-        node = ast.parse(text, mode="eval")
-    except SyntaxError:
+    node = _macro_ast(text)
+    if node is None:
         v = _num(re.sub(r"[^\d.\-+]", "", text))
         return v if v is not None else 0.0
 
@@ -449,7 +468,27 @@ def _macro_eval(expr, variables: Dict[str, float]) -> float:
                 return a / b if b else 0.0
             return 0.0
         if isinstance(nd, ast.Compare):
-            return 1.0 if ev(nd.left) == ev(nd.comparators[0]) else 0.0
+            # 按真实运算符求值 (=, <, >, <=, >=, !=), 旧版把一切比较都当等号。
+            left = ev(nd.left)
+            ok = True
+            for op, comp in zip(nd.ops, nd.comparators):
+                right = ev(comp)
+                if isinstance(op, ast.Eq):
+                    ok = ok and (left == right)
+                elif isinstance(op, ast.NotEq):
+                    ok = ok and (left != right)
+                elif isinstance(op, ast.Lt):
+                    ok = ok and (left < right)
+                elif isinstance(op, ast.LtE):
+                    ok = ok and (left <= right)
+                elif isinstance(op, ast.Gt):
+                    ok = ok and (left > right)
+                elif isinstance(op, ast.GtE):
+                    ok = ok and (left >= right)
+                else:
+                    ok = False
+                left = right
+            return 1.0 if ok else 0.0
         raise ValueError("unsupported macro expression")
 
     try:
@@ -657,7 +696,8 @@ def _expand_macro(prims: List[list], ap_params: List[float], unit_mm: float,
                     ang = rot + k * 90.0
                     corners = [(cx - gap / 2, cy - outer / 2), (cx + gap / 2, cy - outer / 2),
                                (cx + gap / 2, cy + outer / 2), (cx - gap / 2, cy + outer / 2)]
-                    poly(_rot_points(corners, ang), 0)
+                    # 缺口绕热风焊盘中心 (cx,cy) 旋转, 而非宏原点; 否则偏心 thermal 缺口会错位
+                    poly(_rot_points_about(corners, cx, cy, ang), 0)
         except (IndexError, TypeError):
             continue
     return out
@@ -950,22 +990,78 @@ def clear_parse_cache() -> None:
         _PARSE_CACHE.clear()
 
 
-def parse_aperture_table(text):
-    """Explicit simple RS-274D table: D10 C 0.2; D11 R 1.0 0.5.
+_AP_SHAPE_WORDS = {
+    "C": "C", "CIRCLE": "C", "ROUND": "C",
+    "R": "R", "RECT": "R", "RECTANGLE": "R",
+    "SQUARE": "SQUARE",
+    "O": "O", "OBROUND": "O", "OVAL": "O",
+    "P": "P", "POLYGON": "P",
+    "OCTAGON": "OCTAGON",
+}
+_AP_UNIT_FACTOR = {"mm": 1.0, "inch": 25.4, "mil": 0.0254}   # -> mm
+_AP_SUFFIX_UNIT = {"MM": "mm", "IN": "inch", "INCH": "inch", "MIL": "mil", "MILS": "mil"}
+_AP_UNIT_HEADER = re.compile(r"^UNITS?\s*[:=]?\s*(MM|INCH|IN|MILS?)\b", re.IGNORECASE)
+_AP_HEADER_LINE = re.compile(
+    r"^(D-?CODE|APERTURE|SHAPE|SIZE|UNITS?|LIST|FILE|NAME|CODE|NO\.?|GENERATED|"
+    r"DATE|COMMENT|PROGRAM|OUTPUT|FORMAT|SCALE|TOL|MM|INCH|MILS?)\b", re.IGNORECASE)
+_AP_NUMBER = re.compile(r"^([+-]?(?:\d+\.?\d*|\.\d+))(MM|INCH|IN|MILS|MIL)?$", re.IGNORECASE)
 
-    Lengths are in the selected source unit. Unknown dialects are rejected,
-    rather than guessing widths from arbitrary CAM tool reports.
+
+def parse_aperture_table(text, target_unit=None):
+    """RS-274D 外部光圈表, 兼容多种 CAM 导出方言 (尺寸默认按源文件单位):
+
+      - 基本式:   D10 C 0.2 / D11 R 1.0 0.5 / D12 O 1.5 0.6 / D13 P 1.0 6
+      - 形状全称: CIRCLE/ROUND, RECT/RECTANGLE, SQUARE(单边长), OBROUND/OVAL,
+                  POLYGON, OCTAGON(正八边形, 只给外接圆直径)
+      - 分隔符:   空格/逗号/=/冒号; 条目可用 * 或 ; 分隔 (Gerber 风格 D10 C 0.2*)
+      - D 前缀可省略 (10 C 0.2); # 与 // 开头为注释; 常见表头行自动跳过
+      - 单位:     表头 UNITS MM|INCH|MILS 或数值后缀 0.2mm/20mil/0.01in;
+                  给定 target_unit("mm"/"inch") 时自动换算到该单位, 否则按原值
+
+    未知方言仍然报错拒绝, 不从任意 CAM 工具报表猜测尺寸。
     """
-    table = {}
-    for number, line in enumerate(text.splitlines(), 1):
-        line = line.split("#", 1)[0].strip()
-        if not line:
+    if target_unit not in (None, "mm", "inch"):
+        raise ValueError("光圈表目标单位必须为 mm 或 inch")
+    lines = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].split("//", 1)[0].strip()
+        if line:
+            lines.append(line)
+    table_unit = None
+    entries = []
+    for line in lines:
+        um = _AP_UNIT_HEADER.match(line)
+        if um:
+            table_unit = _AP_SUFFIX_UNIT[um.group(1).upper()]
             continue
-        parts = re.split(r"[\s,]+", line.upper())
+        entries.extend(e.strip() for e in re.split(r"[*;]", line) if e.strip())
+    table = {}
+    for number, entry in enumerate(entries, 1):
         try:
+            parts = re.split(r"[\s,:=]+", entry.upper())
+            if not re.match(r"^D?\d+$", parts[0]):
+                if _AP_HEADER_LINE.match(entry):
+                    continue
+                raise ValueError()
             code = int(parts[0].removeprefix("D"))
-            shape = parts[1]
-            params = [float(v) for v in parts[2:]]
+            shape = _AP_SHAPE_WORDS[parts[1]]
+            params, units = [], []
+            for token in parts[2:]:
+                nm = _AP_NUMBER.match(token)
+                if nm:
+                    params.append(float(nm.group(1)))
+                    units.append(_AP_SUFFIX_UNIT[nm.group(2).upper()] if nm.group(2) else table_unit)
+                else:
+                    params.append(float(token))   # 科学计数法/nan 等交给下方校验
+                    units.append(table_unit)
+            if shape == "SQUARE":
+                if len(params) != 1:
+                    raise ValueError()
+                shape, params, units = "R", [params[0], params[0]], units * 2
+            elif shape == "OCTAGON":
+                if len(params) != 1:
+                    raise ValueError()
+                shape, params, units = "P", [params[0], 8.0], [units[0], None]
             minimum = {"C": 1, "R": 2, "O": 2, "P": 2}[shape]
             maximum = {"C": 2, "R": 3, "O": 3, "P": 4}[shape]
             dims = 2 if shape in ("R", "O") else 1
@@ -978,8 +1074,12 @@ def parse_aperture_table(text):
             hole_index = {"C": 1, "R": 2, "O": 2, "P": 3}[shape]
             if len(params) > hole_index and params[hole_index] < 0:
                 raise ValueError()
+            if target_unit is not None:
+                params = [round(v * _AP_UNIT_FACTOR[u] / _AP_UNIT_FACTOR[target_unit], 9)
+                          if u else v for v, u in zip(params, units)]
         except (ValueError, IndexError, KeyError):
-            raise ValueError(f"光圈表第 {number} 行无效；格式例: D10 C 0.2 / D11 R 1.0 0.5") from None
+            raise ValueError(f"光圈表第 {number} 行无效；格式例: D10 C 0.2 / D11 R 1.0 0.5 "
+                             f"(支持 CIRCLE/SQUARE/OBROUND 等全称, * 或 ; 分隔, UNITS 表头)") from None
         table[code] = {"shape": shape, "params": params}
     return table
 
@@ -1307,7 +1407,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         # 覆盖绝大多数命令 (X/Y/I/J + D01..D03, 可带 G01..G03): 单次正则 + 直写
         # PrimStore, 不建 dict。形式不符的一律落到下面的慢路径, 语义完全等价。
         if kind == "cmd" and sr is None:
-            cs = tok[1]
+            cs = tok[1].strip().upper()      # 大小写不敏感: 小写命令同样解析 (与 Rust 内核一致)
             s_g = s_x = s_y = s_i = s_j = s_op = None
             m = _RE_XY.match(cs)                 # 最常见: X..Y..D0x
             if m is not None:
@@ -1315,8 +1415,8 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
             else:
                 m = _RE_ONE.match(cs)            # 次常见: 单轴 X..D0x / Y..D0x
                 if m is not None:
-                    key, val, s_op = m.groups()
-                    if key == "X":
+                    axis, val, s_op = m.groups()   # 用 axis 而非 key: 避免覆盖文件缓存键
+                    if axis == "X":
                         s_x = val
                     else:
                         s_y = val
@@ -1471,7 +1571,9 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         if kind == "ext":
             s = tok[1].strip()
             up = s.upper()
-            m = _FS_RE.search(up)
+            # 锚定匹配: 只认以 FS/MO 开头的扩展命令, 避免 %TO.N,MOIN_5V*% 之类
+            # 网络名/层名里含 MOIN/MOMM 子串被误当成单位声明 (会中途切换单位×25.4)。
+            m = _FS_RE.match(up)
             if m:
                 zero_mode = zero_mode_override or (m.group(1) or "L").upper()
                 coord_mode = (m.group(2) or "A").upper()
@@ -1486,7 +1588,7 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
                 fsta_total = int_digits + dec_digits
                 incremental = incremental or coord_mode == "I"
                 continue
-            m = _MO_RE.search(up)
+            m = _MO_RE.match(up)
             if m:
                 unit = unit_override or ("inch" if m.group(1).upper() == "IN" else "mm")
                 unit_declared = True
@@ -1523,17 +1625,19 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
             if up.startswith("TF"):
                 parts = [p.strip() for p in s.split(",")]
                 head = parts[0] if parts else ""
-                key = head[3:] if head.upper().startswith("TF.") else head[2:]
+                # 注意: 这里用 attr 而非 key —— 复用 key 会覆盖文件缓存键,
+                # 导致 X2 文件以字符串键入缓存, 永远无法命中并污染 LRU。
+                attr = head[3:] if head.upper().startswith("TF.") else head[2:]
                 val = ",".join(parts[1:]).strip()
-                if key == "FileFunction":
+                if attr == "FileFunction":
                     res.file_function = val
-                elif key == "FilePolarity":
+                elif attr == "FilePolarity":
                     res.file_polarity = val
-                elif key == "Part":
+                elif attr == "Part":
                     res.file_part = val
-                elif key == "GenerationSoftware":
+                elif attr == "GenerationSoftware":
                     res.software = val
-                elif key == "CreationDate":
+                elif attr == "CreationDate":
                     res.creation_date = val
                 res.attributes_present = True
                 continue
@@ -1644,9 +1748,9 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
         if _new_op is not None:
             cur_op = _new_op
 
-        # ---- 坐标 X/Y/I/J 单次扫描 (省略 = 沿用当前值) ----
+        # ---- 坐标 X/Y/I/J 单次扫描 (省略 = 沿用当前值; 用大写 up 兼容小写命令) ----
         mx = my = mi = mj = None
-        for cm in _XYIJ_RE.finditer(cmd):
+        for cm in _XYIJ_RE.finditer(up):
             k = cm.group(1)
             if k == "X":
                 if mx is None:
@@ -1723,6 +1827,9 @@ def parse_gerber(path: str, layer_name: Optional[str] = None,
     if missing_apertures:
         res.warnings.append("缺少光圈定义（RS-274D 需外部光圈表）: " +
                             ", ".join("D" + str(code) for code in missing_apertures))
+    if missing_apertures or not fs_seen:
+        res.notes.append("疑似 RS-274D 老格式: 可用『工具 → RS-274D 参数』载入光圈表"
+                         "(支持 CIRCLE/SQUARE/OBROUND 等全称与 UNITS 单位换算) 并指定坐标格式")
     if overridden:
         res.notes.append("已应用用户指定的 Gerber 解析参数，请核对单位、格式和光圈表")
 
@@ -2126,6 +2233,13 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         else:
             int_digits = 2 if unit == "inch" else 3      # 前导零省略: 整数位仅作展示
     total_digits = max(int_digits + dec_digits, max_digits)
+    # 定宽且短于完整格式宽度时, 前导/尾随零省略两种解读会相差 10 倍。
+    # 定宽==全宽时两者一致(补零为空操作), 不打扰; 仅短宽且声明被覆盖时告警,
+    # 避免静默的 10× 坐标/孔径错误 (可用解析参数手动纠正)。
+    if (zero_declared == "T" and fixed_width and max_digits
+            and max_digits < total_digits and not has_decimal):
+        warnings.append(f"文件声明 TZ 但坐标为 {max_digits} 位定宽(短于格式 {total_digits} 位), "
+                        f"已按前导零省略解析, 与声明解读可能相差 10 倍, 请核对坐标/孔径")
 
     # 孔径: 注释按顺序给出但未带 T 号时, 依次对应 T1/T2/...
     auto_t = 0
@@ -2252,6 +2366,9 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         nx = x if x is not None else cur_x
         ny = y if y is not None else cur_y
         tail = (m.group(3) or "").upper()
+        # G00 快移 (rapid): 只定位, 不钻孔/不铣槽 (旧版会把快移当成孔, 产生假孔)。
+        _gm0 = re.match(r"^G0*(\d+)", up)
+        rapid = bool(_gm0 and int(_gm0.group(1)) == 0)
 
         # 内联槽孔: X..Y..G85X..Y.. (起点与终点在同一行)
         slot_to = None
@@ -2272,14 +2389,16 @@ def parse_excellon(path: str, plating: Optional[str] = None,
         if not rep_step[0] and not rep_step[1]:
             rep_step = last_step          # 当前行没有位移时沿用上一次位移
 
-        if slot_to is not None:
+        if rapid:
+            pass                      # 快移不产生孔/槽, 仅更新下方位置
+        elif slot_to is not None:
             add_hole(nx, ny, slot_to=slot_to)
         elif rout_on and prev_point is not None and (nx is not None and ny is not None):
             add_hole(prev_point[0], prev_point[1], slot_to=(nx, ny))
         elif nx is not None and ny is not None:
             add_hole(nx, ny)
         rep = re.search(r"R0*(\d+)", tail)
-        if rep and nx is not None and ny is not None:
+        if rep and not rapid and nx is not None and ny is not None:
             cnt = max(0, int(rep.group(1)) - 1)
             rx_, ry_ = nx, ny
             for _ in range(min(cnt, 10000)):

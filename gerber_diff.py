@@ -41,7 +41,8 @@ def layer_key(layer):
             source = str(layer.data.get("plating") or "").upper()
             plating = True if source == "PTH" else False if source == "NPTH" else None
         via = bool(role.get("via", False))
-        name = os.path.basename(layer.data.get("file") or layer.name).lower() if via else ""
+        # via 钻孔按文件名主干配对, 忽略扩展名差异 (bvh1-2.drl ↔ bvh1-2.nc)
+        name = os.path.splitext(os.path.basename(layer.data.get("file") or layer.name))[0].lower() if via else ""
         return (kind, str(plating), str(via), name)
     side = role.get("side") or ""
     # X2 bottom copper carries L2/L4/etc.; legacy .gbl has no stack index.
@@ -80,6 +81,12 @@ def pair_layers(a, b):
         for i in range(max(len(unmatched), len(remaining))):
             matched.append((unmatched[i] if i < len(unmatched) else None,
                             remaining[i] if i < len(remaining) else None))
+        # 内层铜 1对1 且双方层号都缺失时, 旧版会静默误配; 显式提示用户核对。
+        # (层号一致的同组配对是可信的, 不打扰。)
+        if (len(left) == 1 and len(right) == 1 and key[0] == "copper"
+                and key[1] == "inner" and key[2] == ""
+                and name(left[0]) != name(right[0])):
+            notes.append("内层铜 1对1 按类型配对(层号缺失)，请核对: " + "/".join(key))
         for la, lb in matched:
             label = "/".join(key) + "  " + (la.name if la else "(缺A)") + " ↔ " + (lb.name if lb else "(缺B)")
             if la is None or lb is None:

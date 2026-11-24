@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 from gerber_diff import _dilate_mm, compare, pair_layers
 from gerber_project import load, save
 from gerber_reader import PrimStore, _arc_sample, parse_excellon, parse_gerber
-from gerber_report import manufacturing, write_diff_csv
+from gerber_report import manufacturing, write_diff_csv, write_diff_html, write_diff_txt
 from gerber_viewer import GerberLayer, GerberViewer
 import gerber_native
 import gerber_reader
@@ -196,6 +196,16 @@ class AccuracyTests(unittest.TestCase):
             path = os.path.join(tmp, "diff.csv")
             write_diff_csv(path, result)
             with open(path, encoding="utf-8-sig") as f:
+                self.assertIn("top.gtl", f.read())
+            path = os.path.join(tmp, "diff.html")
+            write_diff_html(path, result)
+            with open(path, encoding="utf-8") as f:
+                html = f.read()
+            self.assertIn("top.gtl", html)
+            self.assertIn("A/B 对比差异报告", html)
+            path = os.path.join(tmp, "diff.txt")
+            write_diff_txt(path, result)
+            with open(path, encoding="utf-8") as f:
                 self.assertIn("top.gtl", f.read())
 
     def test_project_and_manufacturing_report(self):

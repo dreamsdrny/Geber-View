@@ -80,7 +80,8 @@ NAME_RULES: list[LayerRule] = [
             r"\.xln$",
             r"\.exc$",
             r"\.tap$",
-            r"\.txt$",
+            # .txt 既可能是钻孔也可能是制程量测导出的 Gerber, 不能仅凭扩展名判钻孔;
+            # 真钻孔由 identify_layer 按解析内容 (data.kind=="drill") 判定。
             r"\.drl\.",
             r"钻孔",
             r"通孔",
@@ -112,10 +113,14 @@ NAME_RULES: list[LayerRule] = [
     ),
 
     # 阻焊：顶层
+    # 注意: 通用的 soldermask / smask 不带面, 放在下方“未标注面”规则里,
+    # 不能放进本(顶层)规则 —— 否则稳定排序平票时 SMASK_BOT 会被误判成顶层。
     LayerRule(
         patterns=[
-            r"solder[_\-]?mask",
-            r"smask",
+            r"smask[_\-]?top",
+            r"top[_\-]?smask",
+            r"solder[_\-]?mask[_\-]?top",
+            r"top[_\-]?solder[_\-]?mask",
             r"mask[_\-]?top",
             r"top[_\-]?mask",
             r"\.gts$",
@@ -131,6 +136,14 @@ NAME_RULES: list[LayerRule] = [
     # 阻焊：底层
     LayerRule(
         patterns=[
+            r"smask[_\-]?bot",
+            r"smask[_\-]?bottom",
+            r"bot[_\-]?smask",
+            r"bottom[_\-]?smask",
+            r"solder[_\-]?mask[_\-]?bot",
+            r"solder[_\-]?mask[_\-]?bottom",
+            r"bot[_\-]?solder[_\-]?mask",
+            r"bottom[_\-]?solder[_\-]?mask",
             r"mask[_\-]?bot",
             r"mask[_\-]?bottom",
             r"bot[_\-]?mask",
@@ -145,9 +158,9 @@ NAME_RULES: list[LayerRule] = [
         priority=80,
     ),
 
-    # 阻焊：中文命名未标注面 -> 只判类型, 不猜面
+    # 阻焊：命名未标注面 -> 只判类型, 不猜面
     LayerRule(
-        patterns=[r"阻焊", r"防焊", r"绿油", r"solder[_\-]?mask"],
+        patterns=[r"阻焊", r"防焊", r"绿油", r"solder[_\-]?mask", r"smask"],
         kind=KIND_MASK,
         priority=78,
     ),
@@ -176,6 +189,8 @@ NAME_RULES: list[LayerRule] = [
         patterns=[
             r"silkscreen[_\-]?bot",
             r"silkscreen[_\-]?bottom",
+            r"silk[_\-]?bot",
+            r"silk[_\-]?bottom",
             r"bot[_\-]?silk",
             r"bottom[_\-]?silk",
             r"legend[_\-]?bot",
@@ -193,7 +208,7 @@ NAME_RULES: list[LayerRule] = [
 
     # 丝印：中文命名未标注面 -> 只判类型
     LayerRule(
-        patterns=[r"丝印", r"文字", r"字符", r"silkscreen", r"legend"],
+        patterns=[r"丝印", r"文字", r"字符", r"silkscreen", r"legend", r"silk"],
         kind=KIND_SILK,
         priority=68,
     ),
@@ -247,7 +262,6 @@ NAME_RULES: list[LayerRule] = [
             r"component",
             r"\.cmp$",
             r"art[_\-]?top",
-            r"\.art$",
             r"(?:top|顶|正面|元件面).*(?:线路|铜箔|铜层)",
             r"(?:线路|铜箔|铜层).*(?:top|顶|正面|元件面)",
         ],
@@ -416,6 +430,79 @@ def _parse_x2_file_function(file_function: str, name: str) -> Optional[dict]:
 # 文件名规则匹配
 # ---------------------------------------------------------------------------
 
+def _side_index_from_stem(stem: str) -> tuple[str, Optional[int]]:
+    """从层名 token 推断面与层号 (用于 .art artwork / 短名)。
+
+    L2_GND / in2 / inner3 / art02 -> 内层带层号; 层号 1 视为顶层。
+    显式 top/bot(b/sol/solder) token 决定顶/底。
+    """
+    m = re.search(r"(?:^|[_\-])(?:l|in|inner|art)(\d+)", stem)
+    if m:
+        idx = int(m.group(1))
+        return (SIDE_TOP, 1) if idx == 1 else (SIDE_INNER, idx)
+    if re.search(r"(?:^|[_\-])(?:top|t)(?:[_\-]|$)", stem):
+        return SIDE_TOP, 1
+    if re.search(r"(?:^|[_\-])(?:bot|bottom|b|sol|solder)(?:[_\-]|$)", stem):
+        return SIDE_BOTTOM, None
+    return SIDE_UNKNOWN, None
+
+
+def _match_artwork(filename: str) -> Optional[dict]:
+    """Allegro/PADS 等 .art artwork 命名推断。
+
+    旧版把一切 .art 兜底成“顶层铜”, 导致 BOTTOM/L2…L7/SILK_BOT/FAB_DRAWING/PANEL
+    全部误判并污染 A/B 配对。这里按 token 区分图纸/板框/丝印/阻焊/钢网/铜层。
+    """
+    base = os.path.basename(filename).lower()
+    if not base.endswith(".art"):
+        return None
+    stem = base[:-4]
+
+    def res(kind, side=SIDE_UNKNOWN, index=None):
+        return {"kind": kind, "side": side, "index": index,
+                "name": filename, "source": SOURCE_NAME}
+
+    # 制造图纸/拼版/装配图 -> other, 不参与铜层配对
+    if re.search(r"fab(?:rication)?[_\-]?drawing|drawing|panel|assembly|assy|"
+                 r"dimension|detail|drill[_\-]?draw|fab(?=[_\-]|$)", stem):
+        return res(KIND_OTHER)
+
+    # 板框/外形 (OUTLINE.art 等) 优先于铜层兜底
+    if re.search(r"profile|outline|rout|edge[_\.]?cuts|board[_\-]?outline|外形|轮廓|板框", stem):
+        return res(KIND_PROFILE)
+
+    side, index = _side_index_from_stem(stem)
+
+    if re.search(r"silk|legend|silkscreen|(?:^|[_\-])ss[tb]?(?:[_\-]|$)", stem):
+        return res(KIND_SILK, side)
+    if re.search(r"pmask|paste|stencil|cream|(?:^|[_\-])sp[tb]?(?:[_\-]|$)", stem):
+        return res(KIND_PASTE, side)
+    if re.search(r"smask|solder[_\-]?mask|mask|(?:^|[_\-])sm[tb]?(?:[_\-]|$)", stem):
+        return res(KIND_MASK, side)
+
+    # 铜层: 补齐面 (电源/地平面无层号时按内层)
+    if side == SIDE_UNKNOWN:
+        if re.search(r"gnd|pwr|vcc|plane|ground|power", stem):
+            side = SIDE_INNER
+        elif re.search(r"top|component|cmp", stem):
+            side = SIDE_TOP
+        elif re.search(r"bot|bottom|solder|sol", stem):
+            side = SIDE_BOTTOM
+        else:
+            side = SIDE_TOP
+    if side == SIDE_TOP:
+        index = 1
+    elif side == SIDE_BOTTOM:
+        index = None
+    return res(KIND_COPPER, side, index)
+
+
+def _extract_inner_index(low: str) -> Optional[int]:
+    """内层铜规则命中但规则本身未带层号时, 从文件名补提取 (inner2/inr3/gp2/l4)。"""
+    m = re.search(r"(?:inner|inr|in|gp|l)[_\-]?(\d+)", low)
+    return int(m.group(1)) if m else None
+
+
 def _match_cam_convention(filename: str) -> Optional[dict]:
     """识别部分 CAM/制程量测导出的短名约定 (常无扩展名)。
 
@@ -488,6 +575,31 @@ def _match_cam_convention(filename: str) -> Optional[dict]:
         return {"kind": KIND_PROFILE, "side": SIDE_UNKNOWN, "index": None,
                 "name": filename, "source": SOURCE_NAME}
 
+    # 内层铜短名 in2…in7 (常见 CAM 无扩展名导出), 带层号
+    m = re.fullmatch(r"in(\d+)", low)
+    if m:
+        return {"kind": KIND_COPPER, "side": SIDE_INNER, "index": int(m.group(1)),
+                "name": filename, "source": SOURCE_NAME}
+
+    # 板框短名 ol / ol1
+    if re.fullmatch(r"ol\d*", low):
+        return {"kind": KIND_PROFILE, "side": SIDE_UNKNOWN, "index": None,
+                "name": filename, "source": SOURCE_NAME}
+
+    # 常见 CAM 短名: 面按行业惯例推断 (cm=元件面铜, cs=焊接面铜, sm=阻焊,
+    # ss=顶丝印, sss=底丝印)。属最佳猜测, 可在“图层属性”里手动纠正并保存工程。
+    _short = {
+        "cm": (KIND_COPPER, SIDE_TOP),
+        "cs": (KIND_COPPER, SIDE_BOTTOM),
+        "sm": (KIND_MASK, SIDE_TOP),
+        "ss": (KIND_SILK, SIDE_TOP),
+        "sss": (KIND_SILK, SIDE_BOTTOM),
+    }
+    if low in _short:
+        kind, side = _short[low]
+        return {"kind": kind, "side": side, "index": None,
+                "name": filename, "source": SOURCE_NAME}
+
     return None
 
 
@@ -500,12 +612,21 @@ def _match_by_filename(filename: str) -> dict:
     if special is not None:
         return special
 
+    artwork = _match_artwork(filename)
+    if artwork is not None:
+        return artwork
+
     for rule in _NAME_RULES_SORTED:
         if rule.match(low):
+            index = rule.index
+            # 内层铜规则不带固定层号 -> 从文件名补提取, 避免 Inner2/Inner4 塌成一组
+            if (rule.kind == KIND_COPPER and rule.side == SIDE_INNER
+                    and index is None):
+                index = _extract_inner_index(low)
             return {
                 "kind": rule.kind,
                 "side": rule.side,
-                "index": rule.index,
+                "index": index,
                 "name": filename,
                 "source": SOURCE_NAME,
             }
@@ -541,5 +662,22 @@ def identify_layer(data: dict) -> dict:
         result = _parse_x2_file_function(file_function, name)
         if result is not None:
             return result
+
+    # 钻孔以解析内容为准: 真钻孔文件即便叫 .txt 也判钻孔; 反之 Gerber 命名的 .txt
+    # 不会被误判钻孔。先走文件名以保留 CAM 约定的 via/plating 信息。
+    if data.get("kind") == "drill":
+        result = _match_by_filename(name)
+        if result.get("kind") == KIND_DRILL:
+            return result
+        plating = str(data.get("plating") or "").upper()
+        return {
+            "kind": KIND_DRILL,
+            "side": SIDE_UNKNOWN,
+            "index": None,
+            "name": name,
+            "source": SOURCE_NAME,
+            "plated": True if plating == "PTH" else False if plating == "NPTH" else None,
+            "via": bool(data.get("via")),
+        }
 
     return _match_by_filename(name)

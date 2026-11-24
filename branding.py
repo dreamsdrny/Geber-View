@@ -8,6 +8,7 @@ import sys
 
 APP_NAME = "Evan_Gerber_View"
 APP_TITLE = "Gerber Viewer"
+APP_VERSION = "1.1.0"
 APP_USER_MODEL_ID = "Evan.GerberView.App"
 
 ICON_ICO = "Evan_Gerber_View.ico"
@@ -15,8 +16,8 @@ ICON_PNG = "Evan_Gerber_View.png"
 
 
 def win_title(sub: str = "") -> str:
-    """窗口标题: 有子标题 -> '<APP> - <sub>'; 否则主标题"""
-    return f"{APP_NAME} - {sub}" if sub else f"{APP_NAME}: {APP_TITLE}"
+    """窗口标题: 有子标题 -> '<APP> - <sub>'; 否则主标题 (带版本号)"""
+    return f"{APP_NAME} - {sub}" if sub else f"{APP_NAME} v{APP_VERSION}: {APP_TITLE}"
 
 
 def resource_path(name: str) -> str:

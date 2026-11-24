@@ -316,6 +316,48 @@ class CompareTests(unittest.TestCase):
             self.assertEqual(record["parse_options"]["format_override"], [2, 4])
             self.assertEqual(record["parse_options"]["aperture_override"][10]["params"], [1.])
 
+    def test_aperture_table_dialects_and_unit_conversion(self):
+        # 形状全称 / SQUARE 单边长 / OCTAGON 正八边形
+        t = parse_aperture_table("D10 CIRCLE 0.2\nD11 SQUARE 0.5\nD12 OBROUND 1.5 0.6\n"
+                                 "D13 OCTAGON 1.0\nD14 RECTANGLE 1.0 0.5\nD15 POLYGON 1.0 6")
+        self.assertEqual(t[10], {"shape": "C", "params": [0.2]})
+        self.assertEqual(t[11], {"shape": "R", "params": [0.5, 0.5]})
+        self.assertEqual(t[12], {"shape": "O", "params": [1.5, 0.6]})
+        self.assertEqual(t[13], {"shape": "P", "params": [1.0, 8.0]})
+        self.assertEqual(t[15], {"shape": "P", "params": [1.0, 6.0]})
+        # * 与 ; 分隔条目, =/: 分隔字段, D 前缀可省, 注释与常见表头跳过
+        t = parse_aperture_table("# comment\nD-CODE SHAPE SIZE\n10 C 0.2*D11=C,0.5;D12:O 1.5 0.6*\n// done")
+        self.assertEqual(sorted(t), [10, 11, 12])
+        self.assertEqual(t[11]["params"], [0.5])
+        # UNITS 表头 / 数值后缀 -> 换算到目标单位
+        t = parse_aperture_table("UNITS MILS\nD10 C 20\nD11 R 40 20", target_unit="mm")
+        self.assertAlmostEqual(t[10]["params"][0], 0.508)
+        self.assertAlmostEqual(t[11]["params"][0], 1.016)
+        self.assertAlmostEqual(t[11]["params"][1], 0.508)
+        t = parse_aperture_table("D10 C 0.01in\nD11 C 10mil", target_unit="mm")
+        self.assertAlmostEqual(t[10]["params"][0], 0.254)
+        self.assertAlmostEqual(t[11]["params"][0], 0.254)
+        t = parse_aperture_table("UNITS: INCH\nD10 C 0.01", target_unit="inch")
+        self.assertAlmostEqual(t[10]["params"][0], 0.01)
+        # 不给目标单位时按原值 (工程文件回读语义, 不重复换算)
+        self.assertEqual(parse_aperture_table("D10 C 0.508")[10]["params"], [0.508])
+        # 未知方言仍然拒绝
+        for text in ("D10 HEXAGON 1", "HELLO WORLD", "D10 C 0.2mm??", "D10 SQUARE 1 2"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_aperture_table(text)
+
+    def test_rs274d_dialect_table_repairs_legacy_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.gbr")
+            with open(path, "w", encoding="ascii") as f:
+                f.write("G70*G90*G54D10*X010000Y020000D03*X050000Y020000D03*M02*")
+            table = parse_aperture_table("UNITS MILS\nD10 CIRCLE 1000", target_unit="inch")
+            data = parse_gerber(path, unit_override="inch", format_override=(2, 4),
+                                aperture_override=table)
+            self.assertEqual(data["missing_apertures"], [])
+            # bbox 统一输出 mm: 1in/2in/5in -> 25.4/50.8/127
+            self.assertEqual(data["bbox"], [25.4, 50.8, 127.0, 50.8])
+
 
 if __name__ == "__main__":
     unittest.main()

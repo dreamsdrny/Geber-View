@@ -22,6 +22,7 @@ def make_project(layers, path):
                         "color": layer.color, "visible": layer.visible,
                         "scale": layer.scale_factor, "offset": list(layer.offset),
                         "mirror_x": layer.mirror_x,
+                        "role_override": getattr(layer, "role_override", None),
                         "parse_options": getattr(layer, "parse_options", {})})
     return {"version": VERSION, "layers": records}
 
@@ -78,7 +79,19 @@ def load(path):
                     options = dict(options, aperture_override=parse_aperture_table("\n".join(lines)))
                 except (KeyError, TypeError):
                     raise ValueError("工程光圈表无效") from None
+        override = item.get("role_override")
+        if override is not None:
+            kinds = {"copper", "soldermask", "silkscreen", "paste", "profile", "drill", "other"}
+            sides = {"", "top", "bottom", "inner"}
+            idx = override.get("index") if isinstance(override, dict) else None
+            if (not isinstance(override, dict)
+                    or override.get("kind") not in kinds
+                    or override.get("side", "") not in sides
+                    or not (idx is None or (type(idx) is int and idx >= 0))):
+                raise ValueError("工程图层类型覆盖无效")
+            override = {"kind": override["kind"], "side": override.get("side", ""), "index": idx}
         record = dict(item, path=os.path.abspath(os.path.join(base, item["path"])),
-                      scale=factor, offset=offset, group=group, parse_options=options)
+                      scale=factor, offset=offset, group=group, parse_options=options,
+                      role_override=override)
         result.append(record)
     return result

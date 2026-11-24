@@ -1,0 +1,29 @@
+# PyInstaller 版本资源 (exe 右键 → 属性 → 详细信息可见版本号)
+# 注意: 与 branding.py 的 APP_VERSION 保持同步
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '080404B0',
+        [StringStruct('CompanyName', 'Evan'),
+         StringStruct('FileDescription', 'Gerber / NC Drill 查看器 + A/B 对比 (RS-274X / RS-274D)'),
+         StringStruct('FileVersion', '1.1.0.0'),
+         StringStruct('InternalName', 'Evan_Gerber_View'),
+         StringStruct('OriginalFilename', 'Evan_Gerber_View.exe'),
+         StringStruct('ProductName', 'Evan Gerber View'),
+         StringStruct('ProductVersion', '1.1.0'),
+         StringStruct('LegalCopyright', 'Copyright (c) Evan')])
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)

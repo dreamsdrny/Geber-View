@@ -169,7 +169,7 @@ def test_layer_controls(app, root):
     check("layer color column exists", app.tree.heading("#0")["text"] == "颜色")
     names = {w.cget("text"): w for w in buttons}
     controls = ("A组: 导入文件", "A组: 导入文件夹", "B组: 导入文件", "B组: 导入文件夹",
-                "自动定位差异", "查看差异结果", "导出差异CSV", "取消对比")
+                "自动定位差异", "查看差异结果", "导出差异报告", "取消对比")
     for width in (820, 1000, 1220):
         app.win.geometry(f"{width}x780")
         app._show_panel("compare")
@@ -186,6 +186,17 @@ def test_layer_controls(app, root):
               app.canvas.winfo_height() >= app.win.winfo_height() * .78)
         check(f"canvas has most of the width at width {width}",
               app.canvas.winfo_width() >= app.win.winfo_width() * .55)
+
+    app.win.geometry("820x560")
+    app._show_panel("compare")
+    root.update()
+    check("compare actions fit minimum window height", all(
+          names[text].winfo_rooty() + names[text].winfo_height()
+          <= app.compare_panel.winfo_rooty() + app.compare_panel.winfo_height()
+          for text in controls))
+    app._show_panel("layers")
+    app.win.geometry("1220x780")
+    root.update()
 
     layer = app.layers[0]
     app.selected = 0
@@ -264,6 +275,22 @@ def test_layer_controls(app, root):
           and "X " in app._coordinates.get())
     app.status.set("第一行\n第二行")
     check("status bar remains a single line", app._status_display.get() == "第一行")
+    height = app.canvas.winfo_height()
+    app.info.set("较长提示文字，" * 100)
+    root.update()
+    check("long hints do not shrink canvas", app.canvas.winfo_height() == height)
+    app.info.set("滚轮缩放 · 拖动平移 · 双击高亮网络")
+    check("unit and size retained in layer details", "mm" in app.layer_details.get("1.0", tk.END)
+          and "图幅" in app.layer_details.get("1.0", tk.END))
+    app.move_mode.set(True)
+    app._move_mode_toggle()
+    app._measure_toggle()
+    check("measurement disables layer movement", app._measure_on and not app.move_mode.get())
+    app.move_mode.set(True)
+    app._move_mode_toggle()
+    check("layer movement disables measurement", not app._measure_on and not app._measure_var.get())
+    app.move_mode.set(False)
+    app._move_mode_toggle()
     check("A/B panel reports imported layer counts", "A组 1 层" in app.compare_summary.get()
           and "B组 1 层" in app.compare_summary.get())
     for ly, group in zip(app.layers, groups):
@@ -392,6 +419,69 @@ def test_measure_workflow(app, root, tmp):
     check("legacy reparse replaces existing layer", app._batch == 0 and len(app.layers) == 1 and app.layers[0] is ly)
     check("legacy coordinates and aperture repaired", ly.data["bbox"] == [1., 2., 1., 2.] and not ly.data.get("missing_apertures"))
     check("legacy options retained for project", getattr(ly, "parse_options", {}).get("format_override") == (2, 4))
+    app._clear()
+
+
+def test_role_override(app, root, tmp):
+    """手动纠正图层类型: 对话框设置 -> 工程保存 -> 恢复自动识别。"""
+    from tkinter import ttk
+    import gerber_project as gp
+
+    def widgets(w, cls):
+        out = []
+        for c in w.winfo_children():
+            if isinstance(c, cls):
+                out.append(c)
+            out.extend(widgets(c, cls))
+        return out
+
+    def all_tops(w):
+        out = []
+        for c in w.winfo_children():
+            if isinstance(c, tk.Toplevel):
+                out.append(c)
+            out.extend(all_tops(c))
+        return out
+
+    def open_dialog():
+        app._set_layer_role()
+        root.update()
+        return next(t for t in all_tops(root) if "设置图层类型" in t.title())
+
+    app._clear()
+    p = os.path.join(tmp, "cm")
+    io.open(p, "w", encoding="ascii").write(
+        "%FSLAX26Y26*%\n%MOIN*%\n%ADD10C,0.01*%\nD10*\nX100000Y100000D03*\nM02*\n")
+    app.add_layer(p)
+    root.update()
+    ly = app.layers[0]
+    check("short name cm identified as top copper",
+          (ly.role.get("kind"), ly.role.get("side")) == ("copper", "top"))
+    app.selected = 0
+
+    dlg = open_dialog()
+    cbs = widgets(dlg, ttk.Combobox)
+    check("role dialog has kind and side selectors", len(cbs) == 2)
+    cbs[0].set("copper｜铜层")
+    cbs[1].set("bottom｜底层")
+    next(b for b in widgets(dlg, ttk.Button) if b.cget("text") == "确定").invoke()
+    root.update()
+    check("manual override changes side to bottom", ly.role.get("side") == "bottom")
+    check("manual override recorded for project",
+          ly.role_override == {"kind": "copper", "side": "bottom", "index": None}
+          and ly.role.get("source") == "manual")
+
+    proj = os.path.join(tmp, "role.egv.json")
+    gp.save(proj, app.layers)
+    rec = gp.load(proj)[0]
+    check("role override survives project roundtrip",
+          rec["role_override"] == {"kind": "copper", "side": "bottom", "index": None})
+
+    dlg = open_dialog()
+    next(b for b in widgets(dlg, ttk.Button) if b.cget("text") == "恢复自动识别").invoke()
+    root.update()
+    check("restore auto identification clears override",
+          ly.role_override is None and ly.role.get("side") == "top")
     app._clear()
 
 
@@ -622,6 +712,7 @@ def main():
 
         check("macro ap_cache diameters", render({}) == render(None))
 
+    test_role_override(app, root, tmp)
     test_compare_workflow(app, root, tmp)
     test_measure_workflow(app, root, tmp)
 

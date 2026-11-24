@@ -41,6 +41,7 @@ qt-viewer/build-*/
 pip-build-tracker-*/
 pip-ephem-wheel-cache-*/
 pip-install-*/
+tmp*/
 
 # 本地工具/调试日志
 aqtinstall.log
